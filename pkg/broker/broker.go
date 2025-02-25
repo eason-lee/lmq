@@ -3,6 +3,7 @@ package broker
 import (
 	"fmt"
 	"sync"
+	"time"
 
 	"github.com/eason-lee/lmq/pkg/protocol"
 	"github.com/eason-lee/lmq/pkg/store"
@@ -17,9 +18,11 @@ type Subscriber struct {
 
 // Broker 消息代理，负责消息的路由和分发
 type Broker struct {
-	store       *store.FileStore
-	subscribers map[string][]*Subscriber // 主题 -> 订阅者列表
-	mu          sync.RWMutex
+	store               *store.FileStore
+	subscribers         map[string][]*Subscriber // 主题 -> 订阅者列表
+	mu                  sync.RWMutex
+	unackedMessages     map[string]*protocol.Message // 消息ID -> 消息
+	unackedMu           sync.RWMutex
 }
 
 // NewBroker 创建一个新的消息代理
@@ -30,8 +33,9 @@ func NewBroker(storeDir string) (*Broker, error) {
 	}
 
 	return &Broker{
-		store:       fileStore,
-		subscribers: make(map[string][]*Subscriber),
+		store:               fileStore,
+		subscribers:         make(map[string][]*Subscriber),
+		unackedMessages:     make(map[string]*protocol.Message),
 	}, nil
 }
 
@@ -104,4 +108,37 @@ func (b *Broker) Unsubscribe(subID string) {
 // GetMessages 获取指定主题的所有消息
 func (b *Broker) GetMessages(topic string) ([]*protocol.Message, error) {
 	return b.store.GetMessages(topic)
+}
+
+// AckMessage 添加确认消息的方法
+func (b *Broker) AckMessage(messageID string) {
+	b.unackedMu.Lock()
+	defer b.unackedMu.Unlock()
+	
+	delete(b.unackedMessages, messageID)
+}
+
+// RetryUnackedMessages 添加重试未确认消息的方法
+func (b *Broker) RetryUnackedMessages() {
+	b.unackedMu.RLock()
+	messages := make([]*protocol.Message, 0, len(b.unackedMessages))
+	for _, msg := range b.unackedMessages {
+		messages = append(messages, msg)
+	}
+	b.unackedMu.RUnlock()
+
+	for _, msg := range messages {
+		// 重新发布消息
+		b.Publish(msg.Topic, msg.Body)
+	}
+}
+
+// StartRetryTask 启动定时重试任务
+func (b *Broker) StartRetryTask(interval time.Duration) {
+	ticker := time.NewTicker(interval)
+	go func() {
+		for range ticker.C {
+			b.RetryUnackedMessages()
+		}
+	}()
 }

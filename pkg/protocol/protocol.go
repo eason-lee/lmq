@@ -16,11 +16,12 @@ const (
 
 // Command 表示客户端发送的命令
 type Command struct {
-	Type    CommandType     `json:"type"`              // 命令类型
-	Topic   string          `json:"topic,omitempty"`   // 主题
-	Message *Message        `json:"message,omitempty"` // 消息内容
-	Topics  []string        `json:"topics,omitempty"`  // 订阅的主题列表
-	Data    json.RawMessage `json:"data,omitempty"`    // 其他数据
+	Type        CommandType     `json:"type"`              // 命令类型
+	Topic       string          `json:"topic,omitempty"`   // 主题
+	Message     *Message        `json:"message,omitempty"` // 消息内容
+	Topics      []string        `json:"topics,omitempty"`  // 订阅的主题列表
+	Data        json.RawMessage `json:"data,omitempty"`    // 其他数据
+	MessageID   string          `json:"message_id,omitempty"` // 消息ID，用于确认
 }
 
 // Response 表示服务器的响应

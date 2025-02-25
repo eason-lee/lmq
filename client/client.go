@@ -180,7 +180,36 @@ func (c *Client) readResponse() (*protocol.Response, error) {
 	return resp, nil
 }
 
-// 处理服务器响应
+// 添加确认消息的方法
+func (c *Client) AckMessage(messageID string) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	// 创建命令
+	cmd := &protocol.Command{
+		Type:      protocol.CmdAck,
+		MessageID: messageID,
+	}
+
+	// 发送命令
+	if err := c.sendCommand(cmd); err != nil {
+		return err
+	}
+
+	// 读取响应
+	resp, err := c.readResponse()
+	if err != nil {
+		return err
+	}
+
+	if !resp.Success {
+		return fmt.Errorf("确认消息失败: %s", resp.Message)
+	}
+
+	return nil
+}
+
+// 修改 handleResponses 方法，增加自动确认
 func (c *Client) handleResponses() {
 	for {
 		respBytes, err := c.reader.ReadBytes('\n')
@@ -199,7 +228,15 @@ func (c *Client) handleResponses() {
 		if resp.Success && len(resp.Messages) > 0 {
 			for _, msg := range resp.Messages {
 				if handler, ok := c.handlers[msg.Topic]; ok {
-					go handler(msg)
+					go func(m *protocol.Message) {
+						handler(m)
+						// 自动确认消息
+						if err := c.AckMessage(m.ID); err != nil {
+							fmt.Printf("确认消息 %s 失败: %v\n", m.ID, err)
+						}
+					}(msg)
+				} else {
+					fmt.Printf("没有找到主题 %s 的处理函数\n", msg.Topic)
 				}
 			}
 		}

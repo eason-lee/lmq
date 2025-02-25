@@ -17,13 +17,24 @@ func main() {
 	}
 	defer c.Close()
 
+	// 创建一个通道用于同步
+	done := make(chan bool)
+
 	// 订阅主题
 	err = c.Subscribe([]string{"test-topic"}, func(msg *protocol.Message) {
-		fmt.Printf("收到消息: %s, 内容: %s\n", msg.ID, string(msg.Body))
+		fmt.Printf("收到推送消息: %s, 内容: %s\n", msg.ID, string(msg.Body))
+
+		// 如果收到最后一条消息，发出完成信号
+		if string(msg.Body) == "这是消息 #5" {
+			done <- true
+		}
 	})
 	if err != nil {
 		log.Fatalf("订阅失败: %v", err)
 	}
+
+	fmt.Println("已订阅 test-topic，等待消息...")
+	time.Sleep(1 * time.Second) // 确保订阅已完成
 
 	// 发布消息
 	for i := 0; i < 5; i++ {
@@ -33,20 +44,25 @@ func main() {
 			continue
 		}
 		fmt.Printf("发布消息成功: %s\n", msg.ID)
-		time.Sleep(1 * time.Second)
+		time.Sleep(500 * time.Millisecond) // 减少间隔时间
 	}
 
-	// 获取消息
+	// 等待最后一条消息被接收
+	select {
+	case <-done:
+		fmt.Println("所有消息已接收")
+	case <-time.After(10 * time.Second):
+		fmt.Println("等待超时，可能有消息未被接收")
+	}
+
+	// 获取消息历史
 	messages, err := c.Fetch("test-topic")
 	if err != nil {
 		log.Fatalf("获取消息失败: %v", err)
 	}
 
-	fmt.Printf("获取到 %d 条消息:\n", len(messages))
+	fmt.Printf("\n历史消息记录 (%d 条):\n", len(messages))
 	for _, msg := range messages {
 		fmt.Printf("- %s: %s\n", msg.ID, string(msg.Body))
 	}
-
-	// 等待一段时间以接收订阅的消息
-	time.Sleep(5 * time.Second)
 }

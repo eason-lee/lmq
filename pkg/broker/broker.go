@@ -4,8 +4,8 @@ import (
 	"fmt"
 	"sync"
 
-	"github.com/yourusername/lmq/pkg/protocol"
-	"github.com/yourusername/lmq/pkg/store"
+	"github.com/eason-lee/lmq/pkg/protocol"
+	"github.com/eason-lee/lmq/pkg/store"
 )
 
 // Subscriber 表示一个订阅者
@@ -104,4 +104,4 @@ func (b *Broker) Unsubscribe(subID string) {
 // GetMessages 获取指定主题的所有消息
 func (b *Broker) GetMessages(topic string) ([]*protocol.Message, error) {
 	return b.store.GetMessages(topic)
-} 
+}

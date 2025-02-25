@@ -7,7 +7,7 @@ import (
 	"path/filepath"
 	"sync"
 
-	"github.com/yourusername/lmq/pkg/protocol"
+	"github.com/eason-lee/lmq/pkg/protocol"
 )
 
 // FileStore 实现基于文件的消息存储
@@ -62,7 +62,7 @@ func (fs *FileStore) GetMessages(topic string) ([]*protocol.Message, error) {
 	defer fs.mu.RUnlock()
 
 	topicDir := filepath.Join(fs.baseDir, topic)
-	
+
 	// 检查目录是否存在
 	if _, err := os.Stat(topicDir); os.IsNotExist(err) {
 		return []*protocol.Message{}, nil
@@ -104,7 +104,7 @@ func (fs *FileStore) DeleteMessage(topic string, messageID string) error {
 	defer fs.mu.Unlock()
 
 	fileName := filepath.Join(fs.baseDir, topic, messageID+".json")
-	
+
 	// 检查文件是否存在
 	if _, err := os.Stat(fileName); os.IsNotExist(err) {
 		return nil // 文件不存在，视为已删除
@@ -116,4 +116,4 @@ func (fs *FileStore) DeleteMessage(topic string, messageID string) error {
 	}
 
 	return nil
-} 
+}

@@ -11,8 +11,8 @@ import (
 	"os/signal"
 	"syscall"
 
-	"github.com/yourusername/lmq/pkg/broker"
-	"github.com/yourusername/lmq/pkg/protocol"
+	"github.com/eason-lee/lmq/pkg/broker"
+	"github.com/eason-lee/lmq/pkg/protocol"
 )
 
 var (
@@ -194,4 +194,4 @@ func handleSignals() {
 func mustMarshal(v interface{}) json.RawMessage {
 	data, _ := json.Marshal(v)
 	return data
-} 
+}

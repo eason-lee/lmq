@@ -7,7 +7,7 @@ import (
 	"net"
 	"sync"
 
-	"github.com/yourusername/lmq/pkg/protocol"
+	"github.com/eason-lee/lmq/pkg/protocol"
 )
 
 // Client LMQ客户端
@@ -204,4 +204,4 @@ func (c *Client) handleResponses() {
 			}
 		}
 	}
-} 
+}

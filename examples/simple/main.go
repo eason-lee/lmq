@@ -2,10 +2,11 @@ package main
 
 import (
 	"fmt"
+	"lisen/lmq/pkg/protocol"
 	"log"
 	"time"
 
-	"github.com/yourusername/lmq/client"
+	"github.com/eason-lee/lmq/client"
 )
 
 func main() {
@@ -48,4 +49,4 @@ func main() {
 
 	// 等待一段时间以接收订阅的消息
 	time.Sleep(5 * time.Second)
-} 
+}

@@ -2,11 +2,11 @@ package main
 
 import (
 	"fmt"
-	"lisen/lmq/pkg/protocol"
 	"log"
 	"time"
 
 	"github.com/eason-lee/lmq/client"
+	"github.com/eason-lee/lmq/pkg/protocol"
 )
 
 func main() {

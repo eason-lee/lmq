@@ -9,7 +9,7 @@ type Message struct {
 	ID        string    // 消息唯一标识符
 	Topic     string    // 消息主题
 	Body      []byte    // 消息内容
-	Timestamp time.Time // 消息创建时间
+	Timestamp int64 // 消息创建时间
 }
 
 // NewMessage 创建一个新的消息
@@ -18,7 +18,7 @@ func NewMessage(topic string, body []byte) *Message {
 		ID:        generateID(), // 实现一个生成唯一ID的函数
 		Topic:     topic,
 		Body:      body,
-		Timestamp: time.Now(),
+		Timestamp: time.Now().Unix(),
 	}
 }
 

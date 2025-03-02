@@ -41,7 +41,7 @@ func NewProducer(config *ProducerConfig) (*Producer, error) {
 }
 
 // Send 发送消息到指定主题
-func (p *Producer) Send(topic string, data []byte) error {
+func (p *Producer) Send(topic string, data []byte, partitionKey string) error {
     // 选择一个可用的 broker
     broker := p.selectBroker(topic)
     
@@ -51,8 +51,13 @@ func (p *Producer) Send(topic string, data []byte) error {
         return fmt.Errorf("连接 broker 失败: %w", err)
     }
 
-    // 创建发送请求
+    // 创建消息
     msg := protocol.NewMessage(topic, data)
+    
+    // 如果提供了分区键，设置到消息中
+    if partitionKey != "" {
+        msg.PartitionKey = partitionKey
+    }
 
     // 发送消息
     var lastErr error

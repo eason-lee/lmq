@@ -2,14 +2,15 @@ package replication
 
 import (
 	"fmt"
+	"log"
 	"sync"
+
+	"encoding/json" // 添加 json 包
 
 	"github.com/eason-lee/lmq/pkg/network"
 	"github.com/eason-lee/lmq/pkg/protocol"
 	"github.com/eason-lee/lmq/pkg/store"
-    "encoding/json"  // 添加 json 包
 )
-
 
 // ReplicationRequest 复制请求
 type ReplicationRequest struct {
@@ -25,8 +26,6 @@ type ReplicationResponse struct {
     Error   string `json:"error,omitempty"`
     Offset  int64  `json:"offset"`
 }
-
-// ... rest of the code ...
 
 // PartitionMeta 分区元数据
 type PartitionMeta struct {
@@ -137,6 +136,45 @@ func (rm *ReplicaManager) IsLeader(topic string, partition int) bool {
         return p.Leader == rm.nodeID
     }
     return false
+}
+
+// GetPartitions 获取主题的所有分区
+func (rm *ReplicaManager) GetPartitions(topic string) []int {
+    rm.mu.RLock()
+    defer rm.mu.RUnlock()
+    
+    if partitions, ok := rm.partitions[topic]; ok {
+        result := make([]int, 0, len(partitions))
+        for id := range partitions {
+            result = append(result, id)
+        }
+        return result
+    }
+    
+    // 如果主题不存在，创建默认分区
+    rm.mu.RUnlock()
+    rm.mu.Lock()
+    defer rm.mu.Unlock()
+    
+    if _, ok := rm.partitions[topic]; !ok {
+        rm.partitions[topic] = make(map[int]*PartitionMeta)
+        // 创建默认分区
+        meta := &PartitionMeta{
+            Topic:     topic,
+            ID:        0,
+            Leader:    rm.nodeID,
+            Followers: []string{},
+            ISR:       []string{rm.nodeID},
+        }
+        rm.partitions[topic][0] = meta
+        
+        // 创建存储分区
+        if err := rm.store.CreatePartition(topic, 0); err != nil {
+            log.Printf("创建分区失败: %v", err)
+        }
+    }
+    
+    return []int{0}
 }
 
 // ReplicateMessages leader 复制消息到 follower

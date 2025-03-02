@@ -61,10 +61,18 @@ func NewBroker(nodeID string, storeDir string, addr string) (*Broker, error) {
 func (b *Broker) Publish(topic string, data []byte) (*protocol.Message, error) {
 	// 创建消息
 	msg := protocol.NewMessage(topic, data)
-
-	// 保存消息
-	if err := b.store.Save(topic, msg); err != nil {
-		return nil, err
+	
+	// 选择分区
+	partition := b.selectPartition(topic, msg.ID)
+	
+	// 保存消息到分区
+	if err := b.store.Write(topic, partition, []*protocol.Message{msg}); err != nil {
+		return nil, fmt.Errorf("保存消息失败: %w", err)
+	}
+	
+	// 复制到其他节点
+	if err := b.replicaMgr.ReplicateMessages(topic, partition, []*protocol.Message{msg}); err != nil {
+		return nil, fmt.Errorf("复制消息失败: %w", err)
 	}
 
 	// 分发消息给订阅者
@@ -123,10 +131,6 @@ func (b *Broker) Unsubscribe(subID string) {
 	}
 }
 
-// GetMessages 获取指定主题的所有消息
-func (b *Broker) GetMessages(topic string) ([]*protocol.Message, error) {
-	return b.store.GetMessages(topic)
-}
 
 // AckMessage 添加确认消息的方法
 func (b *Broker) AckMessage(messageID string) {
@@ -217,17 +221,48 @@ func (b *Broker) HandleConnection(conn net.Conn) {
 
 // 处理发布消息
 func (b *Broker) handlePublish(msg *protocol.Message) error {
+    // 选择分区
+    partition := b.selectPartition(msg.Topic, msg.ID)
+    
     // 写入存储
-    if err := b.store.Write(msg.Topic, 0, []*protocol.Message{msg}); err != nil {
+    if err := b.store.Write(msg.Topic, partition, []*protocol.Message{msg}); err != nil {
         return fmt.Errorf("存储消息失败: %w", err)
     }
 
     // 复制到其他节点
-    if err := b.replicaMgr.ReplicateMessages(msg.Topic, 0, []*protocol.Message{msg}); err != nil {
+    if err := b.replicaMgr.ReplicateMessages(msg.Topic, partition, []*protocol.Message{msg}); err != nil {
         return fmt.Errorf("复制消息失败: %w", err)
     }
 
     return nil
+}
+
+// selectPartition 选择消息应该发送到的分区
+func (b *Broker) selectPartition(topic string, messageID string) int {
+    // 获取主题的分区数量
+    partitionCount := b.getPartitionCount(topic)
+    if partitionCount <= 0 {
+        // 如果没有分区，默认使用分区0
+        return 0
+    }
+    
+    // 使用消息ID的哈希值来确定分区
+    // 这是一个简单的哈希分区策略，可以根据需要改进
+    hash := 0
+    for _, c := range messageID {
+        hash = 31*hash + int(c)
+    }
+    if hash < 0 {
+        hash = -hash
+    }
+    return hash % partitionCount
+}
+
+// getPartitionCount 获取主题的分区数量
+func (b *Broker) getPartitionCount(topic string) int {
+    // 从复制管理器获取分区信息
+    partitions := b.replicaMgr.GetPartitions(topic)
+    return len(partitions)
 }
 
 // 处理订阅请求

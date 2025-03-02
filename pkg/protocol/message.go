@@ -6,11 +6,12 @@ import (
 
 // Message 表示一个消息
 type Message struct {
-	ID        string    // 消息唯一标识符
-	Type      string    `json:"type"`     // 消息类型：publish, subscribe, ack
-	Topic     string    // 消息主题
-	Body      []byte    // 消息内容
-	Timestamp int64 // 消息创建时间
+    ID           string    `json:"id"`            // 消息唯一标识符
+    Type         string    `json:"type"`          // 消息类型：publish, subscribe, ack
+    Topic        string    `json:"topic"`         // 消息主题
+    PartitionKey string    `json:"partition_key"` // 分区键
+    Body         []byte    `json:"body"`          // 消息内容
+    Timestamp    int64     `json:"timestamp"`     // 消息创建时间
 }
 
 // NewMessage 创建一个新的消息

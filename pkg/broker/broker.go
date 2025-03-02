@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/eason-lee/lmq/pkg/protocol"
+	"github.com/eason-lee/lmq/pkg/replication"
 	"github.com/eason-lee/lmq/pkg/store"
 )
 
@@ -18,11 +19,13 @@ type Subscriber struct {
 
 // Broker 消息代理，负责消息的路由和分发
 type Broker struct {
-	store               *store.FileStore
-	subscribers         map[string][]*Subscriber // 主题 -> 订阅者列表
-	mu                  sync.RWMutex
-	unackedMessages     map[string]*protocol.Message // 消息ID -> 消息
-	unackedMu           sync.RWMutex
+	nodeID          string
+	replicaMgr      *replication.ReplicaManager
+	store           *store.FileStore
+	subscribers     map[string][]*Subscriber // 主题 -> 订阅者列表
+	mu              sync.RWMutex
+	unackedMessages map[string]*protocol.Message // 消息ID -> 消息
+	unackedMu       sync.RWMutex
 }
 
 // NewBroker 创建一个新的消息代理
@@ -33,9 +36,9 @@ func NewBroker(storeDir string) (*Broker, error) {
 	}
 
 	return &Broker{
-		store:               fileStore,
-		subscribers:         make(map[string][]*Subscriber),
-		unackedMessages:     make(map[string]*protocol.Message),
+		store:           fileStore,
+		subscribers:     make(map[string][]*Subscriber),
+		unackedMessages: make(map[string]*protocol.Message),
 	}, nil
 }
 
@@ -114,7 +117,7 @@ func (b *Broker) GetMessages(topic string) ([]*protocol.Message, error) {
 func (b *Broker) AckMessage(messageID string) {
 	b.unackedMu.Lock()
 	defer b.unackedMu.Unlock()
-	
+
 	delete(b.unackedMessages, messageID)
 }
 
@@ -141,4 +144,14 @@ func (b *Broker) StartRetryTask(interval time.Duration) {
 			b.RetryUnackedMessages()
 		}
 	}()
+}
+
+func (b *Broker) handleMessage(topic string, partition int, messages []*protocol.Message) error {
+	// 检查是否是 leader
+	if !b.replicaMgr.IsLeader(topic, partition) {
+		return fmt.Errorf("不是 leader，无法处理写入请求")
+	}
+
+	// 复制消息到 followers
+	return b.replicaMgr.ReplicateMessages(topic, partition, messages)
 }

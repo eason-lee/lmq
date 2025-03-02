@@ -57,3 +57,9 @@ type AckRequest struct {
     GroupID   string `json:"group_id"`
     MessageID string `json:"message_id"`
 }
+
+// 添加心跳相关结构体
+type Heartbeat struct {
+    NodeID    string `json:"node_id"`
+    Timestamp int64  `json:"timestamp"`
+}

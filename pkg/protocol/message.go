@@ -37,4 +37,10 @@ func randomString(length int) string {
 		time.Sleep(1 * time.Nanosecond) // 确保随机性
 	}
 	return string(b)
-} 
+}
+
+type PublishResponse struct {
+    Success   bool   `json:"success"`
+    MessageID string `json:"message_id,omitempty"`
+    Error     string `json:"error,omitempty"`
+}

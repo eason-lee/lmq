@@ -7,6 +7,7 @@ import (
 // Message 表示一个消息
 type Message struct {
 	ID        string    // 消息唯一标识符
+	Type      string    `json:"type"`     // 消息类型：publish, subscribe, ack
 	Topic     string    // 消息主题
 	Body      []byte    // 消息内容
 	Timestamp int64 // 消息创建时间
@@ -43,4 +44,15 @@ type PublishResponse struct {
     Success   bool   `json:"success"`
     MessageID string `json:"message_id,omitempty"`
     Error     string `json:"error,omitempty"`
+}
+
+// 添加以下结构体
+type SubscribeRequest struct {
+    GroupID string   `json:"group_id"`
+    Topics  []string `json:"topics"`
+}
+
+type AckRequest struct {
+    GroupID   string `json:"group_id"`
+    MessageID string `json:"message_id"`
 }

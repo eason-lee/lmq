@@ -1,7 +1,11 @@
 package broker
 
 import (
+	"bufio"
+	"encoding/json"
 	"fmt"
+	"log"
+	"net"
 	"sync"
 	"time"
 
@@ -155,4 +159,110 @@ func (b *Broker) StartRetryTask(interval time.Duration) {
 			b.RetryUnackedMessages()
 		}
 	}()
+}
+
+// 添加新的方法
+func (b *Broker) HandleConnection(conn net.Conn) {
+    defer conn.Close()
+
+    reader := bufio.NewReader(conn)
+    writer := bufio.NewWriter(conn)
+
+    for {
+        // 读取消息
+        data, err := reader.ReadBytes('\n')
+        if err != nil {
+            log.Printf("读取消息失败: %v", err)
+            break
+        }
+
+        // 解析消息
+        var msg protocol.Message
+        if err := json.Unmarshal(data, &msg); err != nil {
+            log.Printf("解析消息失败: %v", err)
+            continue
+        }
+
+        // 根据消息类型处理
+        switch msg.Type {
+        case "publish":
+            // 处理发布消息
+            if err := b.handlePublish(&msg); err != nil {
+                b.sendError(writer, err)
+                continue
+            }
+            b.sendSuccess(writer, "消息发布成功")
+
+        case "subscribe":
+            // 处理订阅请求
+            if err := b.handleSubscribe(conn, &msg); err != nil {
+                b.sendError(writer, err)
+                continue
+            }
+            b.sendSuccess(writer, "订阅成功")
+
+        case "ack":
+            // 处理消息确认
+            if err := b.handleAck(&msg); err != nil {
+                b.sendError(writer, err)
+                continue
+            }
+            b.sendSuccess(writer, "确认成功")
+
+        default:
+            b.sendError(writer, fmt.Errorf("未知的消息类型: %s", msg.Type))
+        }
+    }
+}
+
+// 处理发布消息
+func (b *Broker) handlePublish(msg *protocol.Message) error {
+    // 写入存储
+    if err := b.store.Write(msg.Topic, 0, []*protocol.Message{msg}); err != nil {
+        return fmt.Errorf("存储消息失败: %w", err)
+    }
+
+    // 复制到其他节点
+    if err := b.replicaMgr.ReplicateMessages(msg.Topic, 0, []*protocol.Message{msg}); err != nil {
+        return fmt.Errorf("复制消息失败: %w", err)
+    }
+
+    return nil
+}
+
+// 处理订阅请求
+func (b *Broker) handleSubscribe(conn net.Conn, msg *protocol.Message) error {
+    // TODO: 实现订阅逻辑
+    return nil
+}
+
+// 处理消息确认
+func (b *Broker) handleAck(msg *protocol.Message) error {
+    // TODO: 实现确认逻辑
+    return nil
+}
+
+// 发送错误响应
+func (b *Broker) sendError(writer *bufio.Writer, err error) {
+    resp := &protocol.Response{
+        Success: false,
+        Message:   err.Error(),
+    }
+    b.sendResponse(writer, resp)
+}
+
+// 发送成功响应
+func (b *Broker) sendSuccess(writer *bufio.Writer, message string) {
+    resp := &protocol.Response{
+        Success: true,
+        Message: message,
+    }
+    b.sendResponse(writer, resp)
+}
+
+// 发送响应
+func (b *Broker) sendResponse(writer *bufio.Writer, resp *protocol.Response) {
+    data, _ := json.Marshal(resp)
+    writer.Write(append(data, '\n'))
+    writer.Flush()
 }

@@ -4,9 +4,29 @@ import (
 	"fmt"
 	"sync"
 
+	"github.com/eason-lee/lmq/pkg/network"
 	"github.com/eason-lee/lmq/pkg/protocol"
 	"github.com/eason-lee/lmq/pkg/store"
+    "encoding/json"  // 添加 json 包
 )
+
+
+// ReplicationRequest 复制请求
+type ReplicationRequest struct {
+    Topic     string              `json:"topic"`
+    Partition int                 `json:"partition"`
+    Messages  []*protocol.Message `json:"messages"`
+    Offset    int64              `json:"offset"`
+}
+
+// ReplicationResponse 复制响应
+type ReplicationResponse struct {
+    Success bool   `json:"success"`
+    Error   string `json:"error,omitempty"`
+    Offset  int64  `json:"offset"`
+}
+
+// ... rest of the code ...
 
 // PartitionMeta 分区元数据
 type PartitionMeta struct {
@@ -18,34 +38,81 @@ type PartitionMeta struct {
 }
 
 // ReplicaManager 复制管理器
+// 添加新的字段和方法
 type ReplicaManager struct {
     nodeID    string           // 当前节点 ID
     store     *store.FileStore
     partitions map[string]map[int]*PartitionMeta // topic -> partitionID -> meta
     mu        sync.RWMutex
+    server  *network.Server
+    clients map[string]*network.Client // nodeID -> client
 }
 
-// ReplicationRequest 复制请求
-type ReplicationRequest struct {
-    Topic     string
-    Partition int
-    Messages  []*protocol.Message
-    Offset    int64
-}
-
-// ReplicationResponse 复制响应
-type ReplicationResponse struct {
-    Success bool
-    Offset  int64
-    Error   string
-}
-
-// NewReplicaManager 创建复制管理器
-func NewReplicaManager(nodeID string, store *store.FileStore) *ReplicaManager {
-    return &ReplicaManager{
+// 修改构造函数
+func NewReplicaManager(nodeID string, store *store.FileStore, addr string) *ReplicaManager {
+    rm := &ReplicaManager{
         nodeID:     nodeID,
         store:      store,
         partitions: make(map[string]map[int]*PartitionMeta),
+        server:     network.NewServer(addr),
+        clients:    make(map[string]*network.Client),
+    }
+
+    // 注册复制请求处理器
+    rm.server.RegisterHandler("replication", rm.handleReplicationRequest)
+    
+    return rm
+}
+
+// 添加启动方法
+func (rm *ReplicaManager) Start() error {
+    return rm.server.Start()
+}
+
+// 修改发送到follower的方法
+func (rm *ReplicaManager) sendToFollower(nodeID string, topic string, partition int, messages []*protocol.Message) error {
+    client, ok := rm.clients[nodeID]
+    if !ok {
+        // TODO: 从配置或服务发现获取节点地址
+        addr := fmt.Sprintf("localhost:%d", 9000) // 示例地址
+        var err error
+        client, err = network.NewClient(addr)
+        if err != nil {
+            return err
+        }
+        rm.clients[nodeID] = client
+    }
+
+    req := ReplicationRequest{
+        Topic:     topic,
+        Partition: partition,
+        Messages:  messages,
+    }
+
+    resp, err := client.Send("replication", req)
+    if err != nil {
+        return err
+    }
+
+    if !resp.Success {
+        return fmt.Errorf("复制失败: %s", resp.Error)
+    }
+
+    return nil
+}
+
+// 添加处理复制请求的方法
+func (rm *ReplicaManager) handleReplicationRequest(req *network.Request) *network.Response {
+    var replicationReq ReplicationRequest
+    if err := json.Unmarshal(req.Payload, &replicationReq); err != nil {
+        return &network.Response{Success: false, Error: err.Error()}
+    }
+
+    resp := rm.HandleReplicationRequest(&replicationReq)
+    return &network.Response{
+        Success: resp.Success,
+        Error:   resp.Error,
+        Data:    resp,
     }
 }
 
@@ -148,15 +215,5 @@ func (rm *ReplicaManager) getPartitionMeta(topic string, partition int) *Partiti
     if p, ok := rm.partitions[topic]; ok {
         return p[partition]
     }
-    return nil
-}
-
-// 发送消息到 follower
-func (rm *ReplicaManager) sendToFollower(nodeID string, topic string, partition int, messages []*protocol.Message) error {
-    // TODO: 实现通过网络发送消息到 follower
-    // 1. 建立连接
-    // 2. 发送复制请求
-    // 3. 等待响应
-    // 4. 处理错误
     return nil
 }

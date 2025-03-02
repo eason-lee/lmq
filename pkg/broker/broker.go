@@ -29,17 +29,28 @@ type Broker struct {
 }
 
 // NewBroker 创建一个新的消息代理
-func NewBroker(storeDir string) (*Broker, error) {
-	fileStore, err := store.NewFileStore(storeDir)
-	if err != nil {
-		return nil, err
-	}
+// 修改 Broker 构造函数
+func NewBroker(nodeID string, storeDir string, addr string) (*Broker, error) {
+    fileStore, err := store.NewFileStore(storeDir)
+    if err != nil {
+        return nil, err
+    }
 
-	return &Broker{
-		store:           fileStore,
-		subscribers:     make(map[string][]*Subscriber),
-		unackedMessages: make(map[string]*protocol.Message),
-	}, nil
+    replicaMgr := replication.NewReplicaManager(nodeID, fileStore, addr)
+    broker := &Broker{
+        nodeID:          nodeID,
+        store:          fileStore,
+        replicaMgr:     replicaMgr,
+        subscribers:    make(map[string][]*Subscriber),
+        unackedMessages: make(map[string]*protocol.Message),
+    }
+
+    // 启动复制管理器
+    if err := replicaMgr.Start(); err != nil {
+        return nil, err
+    }
+
+    return broker, nil
 }
 
 // Publish 发布消息到指定主题
@@ -144,14 +155,4 @@ func (b *Broker) StartRetryTask(interval time.Duration) {
 			b.RetryUnackedMessages()
 		}
 	}()
-}
-
-func (b *Broker) handleMessage(topic string, partition int, messages []*protocol.Message) error {
-	// 检查是否是 leader
-	if !b.replicaMgr.IsLeader(topic, partition) {
-		return fmt.Errorf("不是 leader，无法处理写入请求")
-	}
-
-	// 复制消息到 followers
-	return b.replicaMgr.ReplicateMessages(topic, partition, messages)
 }

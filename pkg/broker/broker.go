@@ -1,9 +1,9 @@
 package broker
 
 import (
-	"bufio"
-	"encoding/json"
+	"encoding/binary"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"sync"
@@ -12,6 +12,8 @@ import (
 	"github.com/eason-lee/lmq/pkg/protocol"
 	"github.com/eason-lee/lmq/pkg/replication"
 	"github.com/eason-lee/lmq/pkg/store"
+     pb "github.com/eason-lee/lmq/proto"
+     "google.golang.org/protobuf/proto"
 )
 
 // Subscriber 表示一个订阅者
@@ -184,53 +186,104 @@ func (b *Broker) Start() error {
 func (b *Broker) HandleConnection(conn net.Conn) {
     defer conn.Close()
 
-    reader := bufio.NewReader(conn)
-    writer := bufio.NewWriter(conn)
-
     for {
-        // 读取消息
-        data, err := reader.ReadBytes('\n')
-        if err != nil {
-            log.Printf("读取消息失败: %v", err)
+        // 读取消息长度（4字节）
+        lenBuf := make([]byte, 4)
+        if _, err := io.ReadFull(conn, lenBuf); err != nil {
+            if err != io.EOF {
+                log.Printf("读取消息长度失败: %v", err)
+            }
             break
         }
-
-        // 解析消息
-        var msg protocol.Message
-        if err := json.Unmarshal(data, &msg); err != nil {
-            log.Printf("解析消息失败: %v", err)
+        
+        // 解析消息长度
+        msgLen := binary.BigEndian.Uint32(lenBuf)
+        
+        // 读取消息内容
+        msgBuf := make([]byte, msgLen)
+        if _, err := io.ReadFull(conn, msgBuf); err != nil {
+            log.Printf("读取消息内容失败: %v", err)
+            break
+        }
+        
+        // 反序列化消息
+        var pbMsg pb.Message
+        if err := proto.Unmarshal(msgBuf, &pbMsg); err != nil {
+            log.Printf("反序列化消息失败: %v", err)
             continue
+        }
+        
+        // 转换为内部消息格式
+        msg := &protocol.Message{
+            ID:        pbMsg.Id,
+            Topic:     pbMsg.Topic,
+            Body:      pbMsg.Body,
+            Timestamp: pbMsg.Timestamp,
+            Type:      pbMsg.Type,
         }
 
         // 根据消息类型处理
+        var err error
         switch msg.Type {
         case "publish":
-            // 处理发布消息
-            if err := b.handlePublish(&msg); err != nil {
-                b.sendError(writer, err)
-                continue
-            }
-            b.sendSuccess(writer, "消息发布成功")
-
+            err = b.handlePublish(msg)
         case "subscribe":
-            // 处理订阅请求
-            if err := b.handleSubscribe(conn, &msg); err != nil {
-                b.sendError(writer, err)
-                continue
-            }
-            b.sendSuccess(writer, "订阅成功")
-
+            err = b.handleSubscribe(conn, msg)
         case "ack":
-            // 处理消息确认
-            if err := b.handleAck(&msg); err != nil {
-                b.sendError(writer, err)
-                continue
-            }
-            b.sendSuccess(writer, "确认成功")
-
+            err = b.handleAck(msg)
         default:
-            b.sendError(writer, fmt.Errorf("未知的消息类型: %s", msg.Type))
+            err = fmt.Errorf("未知的消息类型: %s", msg.Type)
         }
+        
+        // 发送响应
+        if err != nil {
+            b.sendProtobufError(conn, err)
+        } else {
+            b.sendProtobufSuccess(conn, "操作成功")
+        }
+    }
+}
+
+// 发送 Protobuf 错误响应
+func (b *Broker) sendProtobufError(conn net.Conn, err error) {
+    resp := &pb.Response{
+        Success: false,
+        Message: err.Error(),
+    }
+    b.sendProtobufResponse(conn, resp)
+}
+
+// 发送 Protobuf 成功响应
+func (b *Broker) sendProtobufSuccess(conn net.Conn, message string) {
+    resp := &pb.Response{
+        Success: true,
+        Message: message,
+    }
+    b.sendProtobufResponse(conn, resp)
+}
+
+// 发送 Protobuf 响应
+func (b *Broker) sendProtobufResponse(conn net.Conn, resp *pb.Response) {
+    // 序列化响应
+    data, err := proto.Marshal(resp)
+    if err != nil {
+        log.Printf("序列化响应失败: %v", err)
+        return
+    }
+    
+    // 准备长度前缀
+    lenBuf := make([]byte, 4)
+    binary.BigEndian.PutUint32(lenBuf, uint32(len(data)))
+    
+    // 发送长度和数据
+    if _, err := conn.Write(lenBuf); err != nil {
+        log.Printf("发送响应长度失败: %v", err)
+        return
+    }
+    
+    if _, err := conn.Write(data); err != nil {
+        log.Printf("发送响应内容失败: %v", err)
+        return
     }
 }
 
@@ -290,29 +343,4 @@ func (b *Broker) handleSubscribe(conn net.Conn, msg *protocol.Message) error {
 func (b *Broker) handleAck(msg *protocol.Message) error {
     // TODO: 实现确认逻辑
     return nil
-}
-
-// 发送错误响应
-func (b *Broker) sendError(writer *bufio.Writer, err error) {
-    resp := &protocol.Response{
-        Success: false,
-        Message:   err.Error(),
-    }
-    b.sendResponse(writer, resp)
-}
-
-// 发送成功响应
-func (b *Broker) sendSuccess(writer *bufio.Writer, message string) {
-    resp := &protocol.Response{
-        Success: true,
-        Message: message,
-    }
-    b.sendResponse(writer, resp)
-}
-
-// 发送响应
-func (b *Broker) sendResponse(writer *bufio.Writer, resp *protocol.Response) {
-    data, _ := json.Marshal(resp)
-    writer.Write(append(data, '\n'))
-    writer.Flush()
 }

@@ -1,0 +1,19 @@
+syntax = "proto3";
+package lmq;
+
+option go_package = "github.com/eason-lee/lmq/pkg/proto";
+
+// 消息定义
+message Message {
+  string id = 1;
+  string topic = 2;
+  bytes body = 3;
+  int64 timestamp = 4;
+  string type = 5;
+}
+
+// 响应定义
+message Response {
+  bool success = 1;
+  string message = 2;
+}

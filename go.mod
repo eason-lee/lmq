@@ -21,4 +21,5 @@ require (
 	github.com/mitchellh/mapstructure v1.5.0 // indirect
 	golang.org/x/exp v0.0.0-20250106191152-7588d65b2ba8 // indirect
 	golang.org/x/sys v0.29.0 // indirect
+	google.golang.org/protobuf v1.36.5
 )

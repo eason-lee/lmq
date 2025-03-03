@@ -30,7 +30,6 @@ type FileStore struct {
 	segmentSize int64                         // 每个段的最大大小
 }
 
-
 // NewFileStore 创建一个新的文件存储
 func NewFileStore(baseDir string) (*FileStore, error) {
 	if err := os.MkdirAll(baseDir, 0755); err != nil {
@@ -140,7 +139,7 @@ func (fs *FileStore) CreatePartition(topic string, partition int) error {
 // 加载分区
 func (fs *FileStore) loadPartition(topic string, partID int) error {
 	partDir := filepath.Join(fs.baseDir, topic, fmt.Sprintf("partition-%d", partID))
-	
+
 	// 创建分区对象
 	partition := &Partition{
 		topic:    topic,
@@ -217,7 +216,7 @@ func (fs *FileStore) Write(topic string, partition int, messages []*protocol.Mes
 		if err := fs.CreatePartition(topic, partition); err != nil {
 			return err
 		}
-		
+
 		fs.mu.RLock()
 		p = fs.partitions[topic][partition]
 		fs.mu.RUnlock()
@@ -225,8 +224,6 @@ func (fs *FileStore) Write(topic string, partition int, messages []*protocol.Mes
 
 	return p.Write(messages)
 }
-
-
 
 // Read 从指定分区读取消息
 func (fs *FileStore) Read(topic string, partition int, offset int64, count int) ([]*protocol.Message, error) {
@@ -240,7 +237,6 @@ func (fs *FileStore) Read(topic string, partition int, offset int64, count int) 
 
 	return p.Read(offset, count)
 }
-
 
 // Close 关闭存储
 func (fs *FileStore) Close() error {
@@ -258,7 +254,6 @@ func (fs *FileStore) Close() error {
 	return nil
 }
 
-
 // CleanupSegments 清理过期的段
 func (fs *FileStore) CleanupSegments(topic string, partition int, retention time.Duration) error {
 	fs.mu.RLock()
@@ -271,8 +266,6 @@ func (fs *FileStore) CleanupSegments(topic string, partition int, retention time
 
 	return p.CleanupSegments(retention)
 }
-
-
 
 // GetMessages 获取指定主题和分区的所有消息
 func (fs *FileStore) GetMessages(topic string) ([]*protocol.Message, error) {
@@ -296,17 +289,11 @@ func (fs *FileStore) GetMessages(topic string) ([]*protocol.Message, error) {
 	return allMessages, nil
 }
 
-// Save 保存单条消息（兼容旧接口）
-func (fs *FileStore) Save(topic string, msg *protocol.Message) error {
-	// 默认使用分区0
-	return fs.Write(topic, 0, []*protocol.Message{msg})
-}
-
 // GetTopics 获取所有主题
 func (fs *FileStore) GetTopics() []string {
 	fs.mu.RLock()
 	defer fs.mu.RUnlock()
-	
+
 	topics := make([]string, 0, len(fs.partitions))
 	for topic := range fs.partitions {
 		topics = append(topics, topic)
@@ -318,7 +305,7 @@ func (fs *FileStore) GetTopics() []string {
 func (fs *FileStore) GetPartitions(topic string) []int {
 	fs.mu.RLock()
 	defer fs.mu.RUnlock()
-	
+
 	if partitions, ok := fs.partitions[topic]; ok {
 		result := make([]int, 0, len(partitions))
 		for partID := range partitions {
@@ -326,6 +313,6 @@ func (fs *FileStore) GetPartitions(topic string) []int {
 		}
 		return result
 	}
-	
+
 	return []int{}
 }

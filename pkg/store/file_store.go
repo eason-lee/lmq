@@ -2,7 +2,6 @@ package store
 
 import (
 	"encoding/binary"
-	"encoding/json"
 	"fmt"
 	"io"
 	"os"
@@ -288,16 +287,16 @@ func (s *Segment) Write(msg *protocol.Message) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	// 序列化消息
-	data, err := json.Marshal(msg)
-	if err != nil {
-		return fmt.Errorf("序列化消息失败: %w", err)
-	}
-
 	// 获取当前文件位置
 	position, err := s.dataFile.Seek(0, io.SeekEnd)
 	if err != nil {
 		return fmt.Errorf("获取文件位置失败: %w", err)
+	}
+
+	// 使用二进制格式序列化消息
+	data, err := serializeMessage(msg)
+	if err != nil {
+		return fmt.Errorf("序列化消息失败: %w", err)
 	}
 
 	// 写入消息数据
@@ -498,12 +497,13 @@ func (s *Segment) Read(offset int64, count int) ([]*protocol.Message, error) {
 			return nil, fmt.Errorf("读取消息数据失败: %w", err)
 		}
 
-		var msg protocol.Message
-		if err := json.Unmarshal(data, &msg); err != nil {
+		// 使用二进制格式反序列化消息
+		msg, err := deserializeMessage(data)
+		if err != nil {
 			return nil, fmt.Errorf("反序列化消息失败: %w", err)
 		}
 
-		messages = append(messages, &msg)
+		messages = append(messages, msg)
 	}
 
 	return messages, nil

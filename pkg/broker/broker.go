@@ -49,8 +49,7 @@ func NewBroker(nodeID string, storeDir string, addr string) (*Broker, error) {
         unackedMessages: make(map[string]*protocol.Message),
     }
 
-    // 启动复制管理器
-    if err := replicaMgr.Start(); err != nil {
+    if err := broker.Start(); err != nil {
         return nil, err
     }
 
@@ -163,6 +162,22 @@ func (b *Broker) StartRetryTask(interval time.Duration) {
 			b.RetryUnackedMessages()
 		}
 	}()
+}
+
+// Start 启动 Broker
+func (b *Broker) Start() error {
+	// 启动复制管理器
+	if err := b.replicaMgr.Start(); err != nil {
+		return err
+	}
+	
+	// 启动清理任务，每小时执行一次，保留7天的数据
+	b.StartCleanupTask(1*time.Hour, 7*24*time.Hour)
+	
+	// 启动重试任务
+	b.StartRetryTask(5 * time.Second)
+	
+	return nil
 }
 
 // 添加新的方法

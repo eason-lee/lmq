@@ -721,3 +721,31 @@ func (fs *FileStore) Save(topic string, msg *protocol.Message) error {
 	// 默认使用分区0
 	return fs.Write(topic, 0, []*protocol.Message{msg})
 }
+
+// GetTopics 获取所有主题
+func (fs *FileStore) GetTopics() []string {
+	fs.mu.RLock()
+	defer fs.mu.RUnlock()
+	
+	topics := make([]string, 0, len(fs.partitions))
+	for topic := range fs.partitions {
+		topics = append(topics, topic)
+	}
+	return topics
+}
+
+// GetPartitions 获取主题的所有分区
+func (fs *FileStore) GetPartitions(topic string) []int {
+	fs.mu.RLock()
+	defer fs.mu.RUnlock()
+	
+	if partitions, ok := fs.partitions[topic]; ok {
+		result := make([]int, 0, len(partitions))
+		for partID := range partitions {
+			result = append(result, partID)
+		}
+		return result
+	}
+	
+	return []int{}
+}

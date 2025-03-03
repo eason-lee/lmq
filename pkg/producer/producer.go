@@ -9,18 +9,30 @@ import (
     "github.com/eason-lee/lmq/pkg/network"
 )
 
+// ProducerConfig 生产者配置
 type ProducerConfig struct {
     Brokers    []string      // broker 节点地址列表
     RetryTimes int           // 发送重试次数
     Timeout    time.Duration // 发送超时时间
 }
 
+// Producer 消息生产者
 type Producer struct {
     config  *ProducerConfig
     clients map[string]*network.Client // broker地址 -> 客户端连接
     mu      sync.RWMutex
 }
 
+// SendResult 发送结果
+type SendResult struct {
+    MessageID string    // 消息ID
+    Topic     string    // 主题
+    Partition int       // 分区
+    Timestamp time.Time // 发送时间
+    Error     error     // 错误信息
+}
+
+// NewProducer 创建一个新的生产者
 func NewProducer(config *ProducerConfig) (*Producer, error) {
     if len(config.Brokers) == 0 {
         return nil, fmt.Errorf("至少需要一个 broker 地址")
@@ -40,15 +52,15 @@ func NewProducer(config *ProducerConfig) (*Producer, error) {
     }, nil
 }
 
-// Send 发送消息到指定主题
-func (p *Producer) Send(topic string, data []byte, partitionKey string) error {
+// Send 同步发送消息到指定主题
+func (p *Producer) Send(topic string, data []byte, partitionKey string) (*SendResult, error) {
     // 选择一个可用的 broker
     broker := p.selectBroker(topic)
     
     // 获取或创建到 broker 的连接
     client, err := p.getClient(broker)
     if err != nil {
-        return fmt.Errorf("连接 broker 失败: %w", err)
+        return nil, fmt.Errorf("连接 broker 失败: %w", err)
     }
 
     // 创建消息
@@ -64,13 +76,74 @@ func (p *Producer) Send(topic string, data []byte, partitionKey string) error {
     for i := 0; i < p.config.RetryTimes; i++ {
         resp, err := client.Send("publish", msg)
         if err == nil && resp.Success {
-            return nil
+            // 解析响应中的分区信息
+            partition := 0
+            if resp.Data != nil {
+                // 将 resp.Data 转换为 map[string]interface{} 类型
+                if dataMap, ok := resp.Data.(map[string]interface{}); ok {
+                    if partInfo, ok := dataMap["partition"].(float64); ok {
+                        partition = int(partInfo)
+                    }
+                }
+            }
+            
+            return &SendResult{
+                MessageID: msg.ID,
+                Topic:     topic,
+                Partition: partition,
+                Timestamp: time.Unix(0, msg.Timestamp),
+                Error:     nil,
+            }, nil
         }
         lastErr = err
         time.Sleep(time.Second * time.Duration(i+1)) // 指数退避
     }
 
-    return fmt.Errorf("发送消息失败，已重试 %d 次: %v", p.config.RetryTimes, lastErr)
+    return &SendResult{
+        MessageID: msg.ID,
+        Topic:     topic,
+        Error:     fmt.Errorf("发送消息失败，已重试 %d 次: %v", p.config.RetryTimes, lastErr),
+    }, lastErr
+}
+
+// SendAsync 异步发送消息到指定主题
+func (p *Producer) SendAsync(topic string, data []byte, partitionKey string, callback func(*SendResult)) {
+    go func() {
+        result, _ := p.Send(topic, data, partitionKey)
+        if callback != nil {
+            callback(result)
+        }
+    }()
+}
+
+// SendBatch 批量发送消息
+func (p *Producer) SendBatch(topic string, messages [][]byte, partitionKey string) ([]*SendResult, error) {
+    results := make([]*SendResult, len(messages))
+    var wg sync.WaitGroup
+    var mu sync.Mutex
+    var hasError bool
+
+    for i, data := range messages {
+        wg.Add(1)
+        go func(idx int, msgData []byte) {
+            defer wg.Done()
+            result, err := p.Send(topic, msgData, partitionKey)
+            
+            mu.Lock()
+            results[idx] = result
+            if err != nil {
+                hasError = true
+            }
+            mu.Unlock()
+        }(i, data)
+    }
+
+    wg.Wait()
+
+    if hasError {
+        return results, fmt.Errorf("部分消息发送失败")
+    }
+    return results, nil
 }
 
 // selectBroker 选择一个 broker（这里先简单实现，后续可以加入负载均衡策略）

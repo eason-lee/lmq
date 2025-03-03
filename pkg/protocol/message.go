@@ -6,12 +6,13 @@ import (
 
 // Message 表示一个消息
 type Message struct {
-    ID           string    `json:"id"`            // 消息唯一标识符
-    Type         string    `json:"type"`          // 消息类型：publish, subscribe, ack
-    Topic        string    `json:"topic"`         // 消息主题
-    PartitionKey string    `json:"partition_key"` // 分区键
-    Body         []byte    `json:"body"`          // 消息内容
-    Timestamp    int64     `json:"timestamp"`     // 消息创建时间
+	ID           string                 `json:"id"`            // 消息唯一标识符
+	Type         string                 `json:"type"`          // 消息类型：publish, subscribe, ack
+	Topic        string                 `json:"topic"`         // 消息主题
+	PartitionKey string                 `json:"partition_key"` // 分区键
+	Body         []byte                 `json:"body"`          // 消息内容
+	Timestamp    int64                  `json:"timestamp"`     // 消息创建时间
+	Data         map[string]interface{} `json:"data"`          // 其他数据
 }
 
 // NewMessage 创建一个新的消息
@@ -42,24 +43,24 @@ func randomString(length int) string {
 }
 
 type PublishResponse struct {
-    Success   bool   `json:"success"`
-    MessageID string `json:"message_id,omitempty"`
-    Error     string `json:"error,omitempty"`
+	Success   bool   `json:"success"`
+	MessageID string `json:"message_id,omitempty"`
+	Error     string `json:"error,omitempty"`
 }
 
 // 添加以下结构体
 type SubscribeRequest struct {
-    GroupID string   `json:"group_id"`
-    Topics  []string `json:"topics"`
+	GroupID string   `json:"group_id"`
+	Topics  []string `json:"topics"`
 }
 
 type AckRequest struct {
-    GroupID   string `json:"group_id"`
-    MessageID string `json:"message_id"`
+	GroupID   string `json:"group_id"`
+	MessageID string `json:"message_id"`
 }
 
 // 添加心跳相关结构体
 type Heartbeat struct {
-    NodeID    string `json:"node_id"`
-    Timestamp int64  `json:"timestamp"`
+	NodeID    string `json:"node_id"`
+	Timestamp int64  `json:"timestamp"`
 }

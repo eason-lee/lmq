@@ -1,201 +1,313 @@
 package consumer
 
 import (
-    "bufio"
-    "encoding/json"
-    "fmt"
-    "net"
-    "sync"
-    "time"
+	"fmt"
+	"log"
+	"sync"
+	"time"
 
-    "github.com/eason-lee/lmq/pkg/protocol"
+	"github.com/eason-lee/lmq/pkg/network"
+	"github.com/eason-lee/lmq/pkg/protocol"
 )
 
+// ConsumerConfig 消费者配置
 type ConsumerConfig struct {
-    Brokers      []string      // broker 地址列表
-    GroupID      string        // 消费者组 ID
-    Topics       []string      // 订阅的主题列表
-    AutoCommit   bool          // 是否自动提交
-    MaxRetries   int          // 最大重试次数
-    RetryTimeout time.Duration // 重试超时时间
+	Brokers      []string      // broker 节点地址列表
+	GroupID      string        // 消费者组ID
+	Topics       []string      // 订阅的主题列表
+	AutoCommit   bool          // 是否自动提交确认
+	CommitInterval time.Duration // 自动提交间隔
+	MaxPullRecords int         // 单次拉取的最大消息数
+	PullTimeout   time.Duration // 拉取超时时间
 }
 
+// Consumer 消息消费者
 type Consumer struct {
-    config   *ConsumerConfig
-    conn     net.Conn
-    reader   *bufio.Reader
-    writer   *bufio.Writer
-    handlers map[string]MessageHandler
-    mu       sync.RWMutex
-    running  bool
-    stopCh   chan struct{}
+	config     *ConsumerConfig
+	client     *network.Client
+	subscribed bool
+	messages   chan *protocol.Message
+	stopCh     chan struct{}
+	wg         sync.WaitGroup
+	mu         sync.RWMutex
 }
 
-type MessageHandler func(*protocol.Message) error
-
+// NewConsumer 创建一个新的消费者
 func NewConsumer(config *ConsumerConfig) (*Consumer, error) {
-    if len(config.Brokers) == 0 {
-        return nil, fmt.Errorf("至少需要一个 broker 地址")
-    }
+	if len(config.Brokers) == 0 {
+		return nil, fmt.Errorf("至少需要一个 broker 地址")
+	}
 
-    if config.GroupID == "" {
-        return nil, fmt.Errorf("必须指定消费者组 ID")
-    }
+	if config.GroupID == "" {
+		return nil, fmt.Errorf("必须指定消费者组ID")
+	}
 
-    if len(config.Topics) == 0 {
-        return nil, fmt.Errorf("至少需要订阅一个主题")
-    }
+	if len(config.Topics) == 0 {
+		return nil, fmt.Errorf("至少需要订阅一个主题")
+	}
 
-    return &Consumer{
-        config:   config,
-        handlers: make(map[string]MessageHandler),
-        stopCh:   make(chan struct{}),
-    }, nil
+	if config.MaxPullRecords <= 0 {
+		config.MaxPullRecords = 100
+	}
+
+	if config.PullTimeout <= 0 {
+		config.PullTimeout = 5 * time.Second
+	}
+
+	// 创建到 broker 的连接
+	client, err := network.NewClient(config.Brokers[0]) // 暂时只连接第一个 broker
+	if err != nil {
+		return nil, fmt.Errorf("连接 broker 失败: %w", err)
+	}
+
+	return &Consumer{
+		config:   config,
+		client:   client,
+		messages: make(chan *protocol.Message, 1000),
+		stopCh:   make(chan struct{}),
+	}, nil
 }
 
-func (c *Consumer) Subscribe(topic string, handler MessageHandler) error {
-    c.mu.Lock()
-    defer c.mu.Unlock()
+// Subscribe 订阅主题
+func (c *Consumer) Subscribe() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 
-    if c.running {
-        return fmt.Errorf("消费者已经在运行，不能添加新的订阅")
-    }
+	if c.subscribed {
+		return nil // 已经订阅过了
+	}
 
-    c.handlers[topic] = handler
-    return nil
+	// 创建订阅请求
+	req := &protocol.Message{
+		Type:  "subscribe",
+		Topic: "", // 不需要指定单个主题，因为我们在请求体中包含了所有主题
+		Body:  nil,
+		Data: map[string]interface{}{
+			"group_id": c.config.GroupID,
+			"topics":   c.config.Topics,
+		},
+	}
+
+	// 发送订阅请求
+	resp, err := c.client.Send(req.Type, req)
+	if err != nil {
+		return fmt.Errorf("发送订阅请求失败: %w", err)
+	}
+
+	if !resp.Success {
+		return fmt.Errorf("订阅失败: %s", resp.Error)
+	}
+
+	c.subscribed = true
+
+	// 启动消息拉取循环
+	c.wg.Add(1)
+	go c.pullMessages()
+
+	// 如果启用了自动提交，启动自动提交循环
+	if c.config.AutoCommit && c.config.CommitInterval > 0 {
+		c.wg.Add(1)
+		go c.autoCommitLoop()
+	}
+
+	return nil
 }
 
-func (c *Consumer) Start() error {
-    c.mu.Lock()
-    if c.running {
-        c.mu.Unlock()
-        return fmt.Errorf("消费者已经在运行")
-    }
-    c.running = true
-    c.mu.Unlock()
-
-    // 连接 broker
-    if err := c.connect(); err != nil {
-        return err
+// Pull 拉取消息
+func (c *Consumer) Pull(timeout time.Duration) []*protocol.Message {
+    if !c.subscribed {
+        if err := c.Subscribe(); err != nil {
+            log.Printf("自动订阅失败: %v", err)
+            return nil
+        }
     }
 
-    // 发送订阅请求
-    if err := c.sendSubscribe(); err != nil {
-        return err
+    var messages []*protocol.Message
+    timeoutCh := time.After(timeout)
+
+    // 收集消息直到超时或达到最大消息数
+    for {
+        select {
+        case msg := <-c.messages:
+            messages = append(messages, msg)
+            if len(messages) >= c.config.MaxPullRecords {
+                return messages
+            }
+        case <-timeoutCh:
+            return messages
+        }
     }
-
-    // 启动消息处理循环
-    go c.consumeLoop()
-
-    return nil
 }
 
-func (c *Consumer) Stop() error {
-    c.mu.Lock()
-    defer c.mu.Unlock()
+// Commit 提交消息确认
+func (c *Consumer) Commit(messageIDs []string) error {
+	if len(messageIDs) == 0 {
+		return nil
+	}
 
-    if !c.running {
-        return nil
-    }
+	// 创建确认请求
+	req := &protocol.Message{
+		Type:  "ack",
+		Topic: "",
+		Body:  nil,
+		Data: map[string]interface{}{
+			"group_id":    c.config.GroupID,
+			"message_ids": messageIDs,
+		},
+	}
 
-    close(c.stopCh)
-    c.running = false
-    return c.conn.Close()
+	// 发送确认请求
+	resp, err := c.client.Send(req.Type, req)
+	if err != nil {
+		return fmt.Errorf("发送确认请求失败: %w", err)
+	}
+
+	if !resp.Success {
+		return fmt.Errorf("确认失败: %s", resp.Error)
+	}
+
+	return nil
 }
 
-func (c *Consumer) connect() error {
-    // 简单起见，先连接第一个 broker
-    conn, err := net.Dial("tcp", c.config.Brokers[0])
-    if err != nil {
-        return fmt.Errorf("连接 broker 失败: %w", err)
-    }
+// Close 关闭消费者
+func (c *Consumer) Close() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 
-    c.conn = conn
-    c.reader = bufio.NewReader(conn)
-    c.writer = bufio.NewWriter(conn)
-    return nil
+	if !c.subscribed {
+		return nil
+	}
+
+	// 发送停止信号
+	close(c.stopCh)
+
+	// 等待所有协程退出
+	c.wg.Wait()
+
+	// 关闭消息通道
+	close(c.messages)
+
+	// 关闭客户端连接
+	if err := c.client.Close(); err != nil {
+		return fmt.Errorf("关闭客户端连接失败: %w", err)
+	}
+
+	c.subscribed = false
+	return nil
 }
 
-func (c *Consumer) sendSubscribe() error {
-    req := &protocol.SubscribeRequest{
-        GroupID: c.config.GroupID,
-        Topics:  c.config.Topics,
-    }
+func (c *Consumer) pullMessages() {
+    defer c.wg.Done()
 
-    data, err := json.Marshal(req)
-    if err != nil {
-        return err
-    }
-
-    if _, err := c.writer.Write(append(data, '\n')); err != nil {
-        return err
-    }
-
-    return c.writer.Flush()
-}
-
-func (c *Consumer) consumeLoop() {
     for {
         select {
         case <-c.stopCh:
             return
         default:
-            if err := c.handleMessage(); err != nil {
-                fmt.Printf("处理消息失败: %v\n", err)
-                time.Sleep(time.Second) // 简单的重试策略
+            // 创建拉取请求
+            req := &protocol.Message{
+                Type:  "pull",  // 修改请求类型
+                Topic: "",
+                Body:  nil,
+                Data: map[string]interface{}{
+                    "group_id":  c.config.GroupID,
+                    "topics":    c.config.Topics,
+                    "max_count": c.config.MaxPullRecords,  // 修改配置字段名
+                    "timeout":   c.config.PullTimeout.Milliseconds(),  // 修改配置字段名
+                },
+            }
+
+            // 发送拉取请求
+            resp, err := c.client.Send(req.Type, req)
+            if err != nil {
+                log.Printf("拉取消息失败: %v", err)
+                time.Sleep(time.Second) // 出错后等待一段时间再重试
+                continue
+            }
+
+            if !resp.Success {
+                log.Printf("拉取消息失败: %s", resp.Error)
+                time.Sleep(time.Second)
+                continue
+            }
+
+            // 处理响应中的消息
+            if resp.Data != nil {
+                if messagesData, ok := resp.Data.(map[string]interface{})["messages"]; ok {
+                    if messagesList, ok := messagesData.([]interface{}); ok {
+                        for _, msgData := range messagesList {
+                            if msgMap, ok := msgData.(map[string]interface{}); ok {
+                                // 构造消息对象
+                                msg := &protocol.Message{}
+                                
+                                if id, ok := msgMap["id"].(string); ok {
+                                    msg.ID = id
+                                }
+                                
+                                if topic, ok := msgMap["topic"].(string); ok {
+                                    msg.Topic = topic
+                                }
+                                
+                                if body, ok := msgMap["body"].([]byte); ok {
+                                    msg.Body = body
+                                }
+                                
+                                if timestamp, ok := msgMap["timestamp"].(float64); ok {
+                                    msg.Timestamp = int64(timestamp)
+                                }
+                                
+                                // 发送到消息通道
+                                select {
+                                case c.messages <- msg:
+                                    // 消息成功发送到通道
+                                default:
+                                    // 通道已满，记录日志
+                                    log.Printf("消息通道已满，丢弃消息: %s", msg.ID)
+                                }
+                            }
+                        }
+                    }
+                }
             }
         }
     }
 }
 
-func (c *Consumer) handleMessage() error {
-    // 读取消息
-    line, err := c.reader.ReadBytes('\n')
-    if err != nil {
-        return err
-    }
+// autoCommitLoop 自动提交确认的循环
+func (c *Consumer) autoCommitLoop() {
+	defer c.wg.Done()
 
-    var msg protocol.Message
-    if err := json.Unmarshal(line, &msg); err != nil {
-        return err
-    }
+	ticker := time.NewTicker(c.config.CommitInterval)
+	defer ticker.Stop()
 
-    // 查找处理函数
-    c.mu.RLock()
-    handler, ok := c.handlers[msg.Topic]
-    c.mu.RUnlock()
+	var pendingMessages []string
 
-    if !ok {
-        return fmt.Errorf("未找到主题 %s 的处理函数", msg.Topic)
-    }
-
-    // 处理消息
-    if err := handler(&msg); err != nil {
-        return err
-    }
-
-    // 如果配置了自动提交，发送确认
-    if c.config.AutoCommit {
-        return c.sendAck(msg.ID)
-    }
-
-    return nil
-}
-
-func (c *Consumer) sendAck(messageID string) error {
-    ack := &protocol.AckRequest{
-        GroupID:   c.config.GroupID,
-        MessageID: messageID,
-    }
-
-    data, err := json.Marshal(ack)
-    if err != nil {
-        return err
-    }
-
-    if _, err := c.writer.Write(append(data, '\n')); err != nil {
-        return err
-    }
-
-    return c.writer.Flush()
+	for {
+		select {
+		case <-c.stopCh:
+			// 在退出前提交所有待确认的消息
+			if len(pendingMessages) > 0 {
+				if err := c.Commit(pendingMessages); err != nil {
+					log.Printf("自动提交失败: %v", err)
+				}
+			}
+			return
+		case <-ticker.C:
+			// 定时提交
+			if len(pendingMessages) > 0 {
+				if err := c.Commit(pendingMessages); err != nil {
+					log.Printf("自动提交失败: %v", err)
+				} else {
+					// 提交成功后清空待确认列表
+					pendingMessages = nil
+				}
+			}
+		case msg := <-c.messages:
+			// 记录消息ID，等待自动提交
+			pendingMessages = append(pendingMessages, msg.ID)
+			
+			// 将消息放回通道，供 Pull 方法获取
+			c.messages <- msg
+		}
+	}
 }

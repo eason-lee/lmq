@@ -12,8 +12,8 @@ import (
 	"github.com/eason-lee/lmq/pkg/protocol"
 	"github.com/eason-lee/lmq/pkg/replication"
 	"github.com/eason-lee/lmq/pkg/store"
-     pb "github.com/eason-lee/lmq/proto"
-     "google.golang.org/protobuf/proto"
+	pb "github.com/eason-lee/lmq/proto"
+	"google.golang.org/protobuf/proto"
 )
 
 // Subscriber 表示一个订阅者
@@ -37,40 +37,40 @@ type Broker struct {
 // NewBroker 创建一个新的消息代理
 // 修改 Broker 构造函数
 func NewBroker(nodeID string, storeDir string, addr string) (*Broker, error) {
-    fileStore, err := store.NewFileStore(storeDir)
-    if err != nil {
-        return nil, err
-    }
+	fileStore, err := store.NewFileStore(storeDir)
+	if err != nil {
+		return nil, err
+	}
 
-    replicaMgr := replication.NewReplicaManager(nodeID, fileStore, addr)
-    broker := &Broker{
-        nodeID:          nodeID,
-        store:          fileStore,
-        replicaMgr:     replicaMgr,
-        subscribers:    make(map[string][]*Subscriber),
-        unackedMessages: make(map[string]*protocol.Message),
-    }
+	replicaMgr := replication.NewReplicaManager(nodeID, fileStore, addr)
+	broker := &Broker{
+		nodeID:          nodeID,
+		store:           fileStore,
+		replicaMgr:      replicaMgr,
+		subscribers:     make(map[string][]*Subscriber),
+		unackedMessages: make(map[string]*protocol.Message),
+	}
 
-    if err := broker.Start(); err != nil {
-        return nil, err
-    }
+	if err := broker.Start(); err != nil {
+		return nil, err
+	}
 
-    return broker, nil
+	return broker, nil
 }
 
 // Publish 发布消息到指定主题
 func (b *Broker) Publish(topic string, data []byte) (*protocol.Message, error) {
 	// 创建消息
 	msg := protocol.NewMessage(topic, data)
-	
+
 	// 选择分区
 	partition := b.selectPartition(topic, msg.ID)
-	
+
 	// 保存消息到分区
 	if err := b.store.Write(topic, partition, []*protocol.Message{msg}); err != nil {
 		return nil, fmt.Errorf("保存消息失败: %w", err)
 	}
-	
+
 	// 复制到其他节点
 	if err := b.replicaMgr.ReplicateMessages(topic, partition, []*protocol.Message{msg}); err != nil {
 		return nil, fmt.Errorf("复制消息失败: %w", err)
@@ -132,7 +132,6 @@ func (b *Broker) Unsubscribe(subID string) {
 	}
 }
 
-
 // AckMessage 添加确认消息的方法
 func (b *Broker) AckMessage(messageID string) {
 	b.unackedMu.Lock()
@@ -172,175 +171,282 @@ func (b *Broker) Start() error {
 	if err := b.replicaMgr.Start(); err != nil {
 		return err
 	}
-	
+
 	// 启动清理任务，每小时执行一次，保留7天的数据
 	b.StartCleanupTask(1*time.Hour, 7*24*time.Hour)
-	
+
 	// 启动重试任务
 	b.StartRetryTask(5 * time.Second)
-	
+
 	return nil
 }
 
 // 添加新的方法
 func (b *Broker) HandleConnection(conn net.Conn) {
-    defer conn.Close()
+	defer conn.Close()
 
-    for {
-        // 读取消息长度（4字节）
-        lenBuf := make([]byte, 4)
-        if _, err := io.ReadFull(conn, lenBuf); err != nil {
-            if err != io.EOF {
-                log.Printf("读取消息长度失败: %v", err)
-            }
-            break
-        }
-        
-        // 解析消息长度
-        msgLen := binary.BigEndian.Uint32(lenBuf)
-        
-        // 读取消息内容
-        msgBuf := make([]byte, msgLen)
-        if _, err := io.ReadFull(conn, msgBuf); err != nil {
-            log.Printf("读取消息内容失败: %v", err)
-            break
-        }
-        
-        // 反序列化消息
-        var pbMsg pb.Message
-        if err := proto.Unmarshal(msgBuf, &pbMsg); err != nil {
-            log.Printf("反序列化消息失败: %v", err)
-            continue
-        }
-        
-        // 转换为内部消息格式
-        msg := &protocol.Message{
-            ID:        pbMsg.Id,
-            Topic:     pbMsg.Topic,
-            Body:      pbMsg.Body,
-            Timestamp: pbMsg.Timestamp,
-            Type:      pbMsg.Type,
-        }
+	for {
+		// 读取消息长度（4字节）
+		lenBuf := make([]byte, 4)
+		if _, err := io.ReadFull(conn, lenBuf); err != nil {
+			if err != io.EOF {
+				log.Printf("读取消息长度失败: %v", err)
+			}
+			break
+		}
 
-        // 根据消息类型处理
-        var err error
-        switch msg.Type {
-        case "publish":
-            err = b.handlePublish(msg)
-        case "subscribe":
-            err = b.handleSubscribe(conn, msg)
-        case "ack":
-            err = b.handleAck(msg)
-        default:
-            err = fmt.Errorf("未知的消息类型: %s", msg.Type)
-        }
-        
-        // 发送响应
-        if err != nil {
-            b.sendProtobufError(conn, err)
-        } else {
-            b.sendProtobufSuccess(conn, "操作成功")
-        }
-    }
+		// 解析消息长度
+		msgLen := binary.BigEndian.Uint32(lenBuf)
+
+		// 读取消息内容
+		msgBuf := make([]byte, msgLen)
+		if _, err := io.ReadFull(conn, msgBuf); err != nil {
+			log.Printf("读取消息内容失败: %v", err)
+			break
+		}
+
+		// 反序列化消息
+		var pbMsg pb.Message
+		if err := proto.Unmarshal(msgBuf, &pbMsg); err != nil {
+			log.Printf("反序列化消息失败: %v", err)
+			continue
+		}
+
+		// 转换为内部消息格式
+		msg := &protocol.Message{
+			ID:        pbMsg.Id,
+			Topic:     pbMsg.Topic,
+			Body:      pbMsg.Body,
+			Timestamp: pbMsg.Timestamp,
+			Type:      pbMsg.Type,
+		}
+
+		// 根据消息类型处理
+		var err error
+		switch msg.Type {
+		case "publish":
+			err = b.handlePublish(msg)
+		case "subscribe":
+			err = b.handleSubscribe(conn, msg)
+		case "ack":
+			err = b.handleAck(msg)
+		default:
+			err = fmt.Errorf("未知的消息类型: %s", msg.Type)
+		}
+
+		// 发送响应
+		if err != nil {
+			b.sendProtobufError(conn, err)
+		} else {
+			b.sendProtobufSuccess(conn, "操作成功")
+		}
+	}
 }
 
 // 发送 Protobuf 错误响应
 func (b *Broker) sendProtobufError(conn net.Conn, err error) {
-    resp := &pb.Response{
-        Success: false,
-        Message: err.Error(),
-    }
-    b.sendProtobufResponse(conn, resp)
+	resp := &pb.Response{
+		Success: false,
+		Message: err.Error(),
+	}
+	b.sendProtobufResponse(conn, resp)
 }
 
 // 发送 Protobuf 成功响应
 func (b *Broker) sendProtobufSuccess(conn net.Conn, message string) {
-    resp := &pb.Response{
-        Success: true,
-        Message: message,
-    }
-    b.sendProtobufResponse(conn, resp)
+	resp := &pb.Response{
+		Success: true,
+		Message: message,
+	}
+	b.sendProtobufResponse(conn, resp)
 }
 
 // 发送 Protobuf 响应
 func (b *Broker) sendProtobufResponse(conn net.Conn, resp *pb.Response) {
-    // 序列化响应
-    data, err := proto.Marshal(resp)
-    if err != nil {
-        log.Printf("序列化响应失败: %v", err)
-        return
-    }
-    
-    // 准备长度前缀
-    lenBuf := make([]byte, 4)
-    binary.BigEndian.PutUint32(lenBuf, uint32(len(data)))
-    
-    // 发送长度和数据
-    if _, err := conn.Write(lenBuf); err != nil {
-        log.Printf("发送响应长度失败: %v", err)
-        return
-    }
-    
-    if _, err := conn.Write(data); err != nil {
-        log.Printf("发送响应内容失败: %v", err)
-        return
-    }
+	// 序列化响应
+	data, err := proto.Marshal(resp)
+	if err != nil {
+		log.Printf("序列化响应失败: %v", err)
+		return
+	}
+
+	// 准备长度前缀
+	lenBuf := make([]byte, 4)
+	binary.BigEndian.PutUint32(lenBuf, uint32(len(data)))
+
+	// 发送长度和数据
+	if _, err := conn.Write(lenBuf); err != nil {
+		log.Printf("发送响应长度失败: %v", err)
+		return
+	}
+
+	if _, err := conn.Write(data); err != nil {
+		log.Printf("发送响应内容失败: %v", err)
+		return
+	}
 }
 
 // 处理发布消息
 func (b *Broker) handlePublish(msg *protocol.Message) error {
-    // 选择分区
-    partition := b.selectPartition(msg.Topic, msg.ID)
-    
-    // 写入存储
-    if err := b.store.Write(msg.Topic, partition, []*protocol.Message{msg}); err != nil {
-        return fmt.Errorf("存储消息失败: %w", err)
-    }
+	// 选择分区
+	partition := b.selectPartition(msg.Topic, msg.ID)
 
-    // 复制到其他节点
-    if err := b.replicaMgr.ReplicateMessages(msg.Topic, partition, []*protocol.Message{msg}); err != nil {
-        return fmt.Errorf("复制消息失败: %w", err)
-    }
+	// 写入存储
+	if err := b.store.Write(msg.Topic, partition, []*protocol.Message{msg}); err != nil {
+		return fmt.Errorf("存储消息失败: %w", err)
+	}
 
-    return nil
+	// 复制到其他节点
+	if err := b.replicaMgr.ReplicateMessages(msg.Topic, partition, []*protocol.Message{msg}); err != nil {
+		return fmt.Errorf("复制消息失败: %w", err)
+	}
+
+	return nil
 }
 
 // selectPartition 选择消息应该发送到的分区
 func (b *Broker) selectPartition(topic string, messageID string) int {
-    // 获取主题的分区数量
-    partitionCount := b.getPartitionCount(topic)
-    if partitionCount <= 0 {
-        // 如果没有分区，默认使用分区0
-        return 0
-    }
-    
-    // 使用消息ID的哈希值来确定分区
-    // 这是一个简单的哈希分区策略，可以根据需要改进
-    hash := 0
-    for _, c := range messageID {
-        hash = 31*hash + int(c)
-    }
-    if hash < 0 {
-        hash = -hash
-    }
-    return hash % partitionCount
+	// 获取主题的分区数量
+	partitionCount := b.getPartitionCount(topic)
+	if partitionCount <= 0 {
+		// 如果没有分区，默认使用分区0
+		return 0
+	}
+
+	// 使用消息ID的哈希值来确定分区
+	// 这是一个简单的哈希分区策略，可以根据需要改进
+	hash := 0
+	for _, c := range messageID {
+		hash = 31*hash + int(c)
+	}
+	if hash < 0 {
+		hash = -hash
+	}
+	return hash % partitionCount
 }
 
 // getPartitionCount 获取主题的分区数量
 func (b *Broker) getPartitionCount(topic string) int {
-    // 从复制管理器获取分区信息
-    partitions := b.replicaMgr.GetPartitions(topic)
-    return len(partitions)
+	// 从复制管理器获取分区信息
+	partitions := b.replicaMgr.GetPartitions(topic)
+	return len(partitions)
 }
 
 // 处理订阅请求
 func (b *Broker) handleSubscribe(conn net.Conn, msg *protocol.Message) error {
-    // TODO: 实现订阅逻辑
-    return nil
+	// 从消息数据中提取订阅信息
+	data := msg.Data
+
+	// 提取消费者组ID
+	groupID, ok := data["group_id"].(string)
+	if !ok || groupID == "" {
+		return fmt.Errorf("必须提供有效的消费者组ID")
+	}
+
+	// 提取主题列表
+	topicsData, ok := data["topics"].([]interface{})
+	if !ok {
+		return fmt.Errorf("必须提供主题列表")
+	}
+
+	topics := make([]string, 0, len(topicsData))
+	for _, t := range topicsData {
+		if topic, ok := t.(string); ok && topic != "" {
+			topics = append(topics, topic)
+		}
+	}
+
+	if len(topics) == 0 {
+		return fmt.Errorf("至少需要订阅一个有效主题")
+	}
+
+	// 创建唯一的订阅者ID
+	subID := fmt.Sprintf("%s-%s-%d", groupID, conn.RemoteAddr().String(), time.Now().UnixNano())
+
+	// 创建订阅者
+	sub, err := b.Subscribe(subID, topics, 1000) // 使用1000作为缓冲区大小
+	if err != nil {
+		return fmt.Errorf("创建订阅失败: %w", err)
+	}
+
+	// 启动一个协程来处理消息推送
+	go func() {
+		defer b.Unsubscribe(subID)
+
+		for msg := range sub.Ch {
+			// 将消息转换为Protobuf格式
+			pbMsg := &pb.Message{
+				Id:        msg.ID,
+				Topic:     msg.Topic,
+				Body:      msg.Body,
+				Timestamp: msg.Timestamp,
+				Type:      "message", // 标记为普通消息
+			}
+
+			// 序列化消息
+			data, err := proto.Marshal(pbMsg)
+			if err != nil {
+				log.Printf("序列化消息失败: %v", err)
+				continue
+			}
+
+			// 准备长度前缀
+			lenBuf := make([]byte, 4)
+			binary.BigEndian.PutUint32(lenBuf, uint32(len(data)))
+
+			// 发送消息
+			b.unackedMu.Lock()
+			b.unackedMessages[msg.ID] = msg // 添加到未确认消息列表
+			b.unackedMu.Unlock()
+
+			// 使用互斥锁保护写操作
+			var mu sync.Mutex
+			mu.Lock()
+			if _, err := conn.Write(lenBuf); err != nil {
+				mu.Unlock()
+				log.Printf("发送消息长度失败: %v", err)
+				return
+			}
+
+			if _, err := conn.Write(data); err != nil {
+				mu.Unlock()
+				log.Printf("发送消息内容失败: %v", err)
+				return
+			}
+			mu.Unlock()
+		}
+	}()
+
+	// 发送成功响应
+	resp := &pb.Response{
+		Success: true,
+		Message: "订阅成功",
+	}
+
+	// 序列化响应
+	respData, err := proto.Marshal(resp)
+	if err != nil {
+		return fmt.Errorf("序列化响应失败: %w", err)
+	}
+
+	// 准备长度前缀
+	lenBuf := make([]byte, 4)
+	binary.BigEndian.PutUint32(lenBuf, uint32(len(respData)))
+
+	// 发送响应
+	if _, err := conn.Write(lenBuf); err != nil {
+		return fmt.Errorf("发送响应长度失败: %w", err)
+	}
+
+	if _, err := conn.Write(respData); err != nil {
+		return fmt.Errorf("发送响应内容失败: %w", err)
+	}
+
+	return nil
 }
 
 // 处理消息确认
 func (b *Broker) handleAck(msg *protocol.Message) error {
-    // TODO: 实现确认逻辑
-    return nil
+	// TODO: 实现确认逻辑
+	return nil
 }

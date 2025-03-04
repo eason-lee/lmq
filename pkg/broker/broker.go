@@ -447,6 +447,46 @@ func (b *Broker) handleSubscribe(conn net.Conn, msg *protocol.Message) error {
 
 // 处理消息确认
 func (b *Broker) handleAck(msg *protocol.Message) error {
-	// TODO: 实现确认逻辑
+	// 从消息数据中提取确认信息
+	data := msg.Data
+	
+	// 提取消费者组ID
+	groupID, ok := data["group_id"].(string)
+	if !ok || groupID == "" {
+		return fmt.Errorf("必须提供有效的消费者组ID")
+	}
+	
+	// 提取要确认的消息ID列表
+	messageIDsData, ok := data["message_ids"].([]interface{})
+	if !ok {
+		return fmt.Errorf("必须提供要确认的消息ID列表")
+	}
+	
+	// 转换消息ID列表
+	messageIDs := make([]string, 0, len(messageIDsData))
+	for _, id := range messageIDsData {
+		if msgID, ok := id.(string); ok && msgID != "" {
+			messageIDs = append(messageIDs, msgID)
+		}
+	}
+	
+	if len(messageIDs) == 0 {
+		return fmt.Errorf("至少需要确认一个有效消息ID")
+	}
+	
+	// 记录确认信息
+	log.Printf("消费者组 %s 确认了 %d 条消息", groupID, len(messageIDs))
+	
+	// 从未确认消息列表中移除这些消息
+	b.unackedMu.Lock()
+	for _, msgID := range messageIDs {
+		delete(b.unackedMessages, msgID)
+	}
+	b.unackedMu.Unlock()
+	
+	// 更新消费者组的消费位置
+	// 注意：这里需要根据实际存储实现来更新消费位置
+	// 如果使用了持久化的消费位置，应该在这里更新
+	
 	return nil
 }

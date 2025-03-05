@@ -23,6 +23,7 @@ func NewClient(addr string) (*Client, error) {
 }
 
 func (c *Client) Send(reqType string, payload interface{}) (*Response, error) {
+    // TODO: 序列化 payload 使用 proto
     payloadBytes, err := json.Marshal(payload)
     if err != nil {
         return nil, err

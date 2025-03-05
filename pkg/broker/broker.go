@@ -9,6 +9,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/eason-lee/lmq/pkg/cluster"
+	"github.com/eason-lee/lmq/pkg/network"
 	"github.com/eason-lee/lmq/pkg/protocol"
 	"github.com/eason-lee/lmq/pkg/replication"
 	"github.com/eason-lee/lmq/pkg/store"
@@ -32,10 +34,10 @@ type Broker struct {
 	mu              sync.RWMutex
 	unackedMessages map[string]*protocol.Message // 消息ID -> 消息
 	unackedMu       sync.RWMutex
+    clusterMgr      *cluster.ClusterManager // 新增：集群管理器
 }
 
 // NewBroker 创建一个新的消息代理
-// 修改 Broker 构造函数
 func NewBroker(nodeID string, storeDir string, addr string) (*Broker, error) {
 	fileStore, err := store.NewFileStore(storeDir)
 	if err != nil {
@@ -51,12 +53,41 @@ func NewBroker(nodeID string, storeDir string, addr string) (*Broker, error) {
 		unackedMessages: make(map[string]*protocol.Message),
 	}
 
-	if err := broker.Start(); err != nil {
-		return nil, err
-	}
+	// 初始化集群管理器
+	broker.clusterMgr = cluster.NewClusterManager(nodeID, addr)
 
 	return broker, nil
 }
+
+// 修改 Start 方法
+func (b *Broker) Start(server *network.Server, seedNodeAddr string) error {
+	// 启动复制管理器
+	if err := b.replicaMgr.Start(); err != nil {
+		return err
+	}
+
+	// 启动清理任务
+	b.StartCleanupTask(1*time.Hour, 7*24*time.Hour)
+
+	// 启动重试任务
+	b.StartRetryTask(5 * time.Second)
+    
+    // 注册集群消息处理器
+    b.clusterMgr.RegisterHandlers(server)
+    
+    // 加入集群
+    if err := b.clusterMgr.JoinCluster(seedNodeAddr); err != nil {
+        return fmt.Errorf("加入集群失败: %w", err)
+    }
+    
+    // 启动集群管理器
+	if err := b.clusterMgr.Start(); err != nil {
+		return err
+	}
+
+	return nil
+}
+
 
 // Publish 发布消息到指定主题
 func (b *Broker) Publish(topic string, data []byte) (*protocol.Message, error) {
@@ -165,23 +196,7 @@ func (b *Broker) StartRetryTask(interval time.Duration) {
 	}()
 }
 
-// Start 启动 Broker
-func (b *Broker) Start() error {
-	// 启动复制管理器
-	if err := b.replicaMgr.Start(); err != nil {
-		return err
-	}
 
-	// 启动清理任务，每小时执行一次，保留7天的数据
-	b.StartCleanupTask(1*time.Hour, 7*24*time.Hour)
-
-	// 启动重试任务
-	b.StartRetryTask(5 * time.Second)
-
-	return nil
-}
-
-// 添加新的方法
 func (b *Broker) HandleConnection(conn net.Conn) {
 	defer conn.Close()
 
@@ -230,6 +245,9 @@ func (b *Broker) HandleConnection(conn net.Conn) {
 			err = b.handleSubscribe(conn, msg)
 		case "ack":
 			err = b.handleAck(msg)
+		case "heartbeat", "node_join", "node_leave":
+			// 将集群相关消息转发给集群管理器处理
+			err = b.clusterMgr.HandleClusterMessage(msg)
 		default:
 			err = fmt.Errorf("未知的消息类型: %s", msg.Type)
 		}

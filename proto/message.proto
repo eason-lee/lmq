@@ -1,7 +1,7 @@
 syntax = "proto3";
 package lmq;
 
-option go_package = "github.com/eason-lee/lmq/pkg/proto";
+option go_package = "github.com/eason-lee/lmq/proto";
 
 // 消息定义
 message Message {
@@ -10,10 +10,44 @@ message Message {
   bytes body = 3;
   int64 timestamp = 4;
   string type = 5;
+  map<string, string> data = 6;  
+}
+
+// 请求消息
+message Request {
+  string type = 1;
+  map<string, string> data = 2;
+  
+  // 不同类型请求的特定数据
+  PublishRequest publish_data = 3;
+  SubscribeRequest subscribe_data = 4;
+  AckRequest ack_data = 5;
+  
+  // 可以根据需要添加更多特定类型的请求数据
+}
+
+// 发布请求
+message PublishRequest {
+  string topic = 1;
+  bytes body = 2;
+}
+
+// 订阅请求
+message SubscribeRequest {
+  string group_id = 1;
+  repeated string topics = 2;
+}
+
+// 确认请求
+message AckRequest {
+  string group_id = 1;
+  repeated string message_ids = 2;
 }
 
 // 响应定义
 message Response {
   bool success = 1;
-  string message = 2;
+  string message = 2;  
+  string error = 3;    
+  map<string, string> data = 4;  
 }

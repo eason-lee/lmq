@@ -94,13 +94,6 @@ func (c *Client) Send(reqType string, payload interface{}) (*Response, error) {
 // setRequestPayload 根据请求类型设置不同的负载
 func setRequestPayload(req *pb.Request, reqType string, payload interface{}) error {
     switch reqType {
-    case "heartbeat":
-        if data, ok := payload.(map[string]interface{}); ok {
-            req.Data = make(map[string]string)
-            for k, v := range data {
-                req.Data[k] = fmt.Sprintf("%v", v)
-            }
-        }
     case "node_join", "node_leave":
         if data, ok := payload.(map[string]interface{}); ok {
             req.Data = make(map[string]string)

@@ -1,16 +1,22 @@
 package broker
 
 import (
+	"crypto/md5"
 	"encoding/binary"
 	"fmt"
 	"io"
 	"log"
 	"net"
+	"os"
+	"os/signal"
+	"path/filepath"
+	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/eason-lee/lmq/pkg/cluster"
-	"github.com/eason-lee/lmq/pkg/network"
+	"github.com/eason-lee/lmq/pkg/coordinator"
 	"github.com/eason-lee/lmq/pkg/protocol"
 	"github.com/eason-lee/lmq/pkg/replication"
 	"github.com/eason-lee/lmq/pkg/store"
@@ -28,6 +34,7 @@ type Subscriber struct {
 // Broker 消息代理，负责消息的路由和分发
 type Broker struct {
 	nodeID          string
+	addr            string
 	replicaMgr      *replication.ReplicaManager
 	store           *store.FileStore
 	subscribers     map[string][]*Subscriber // 主题 -> 订阅者列表
@@ -35,10 +42,22 @@ type Broker struct {
 	unackedMessages map[string]*protocol.Message // 消息ID -> 消息
 	unackedMu       sync.RWMutex
     clusterMgr      *cluster.ClusterManager // 新增：集群管理器
+	coordinator      coordinator.Coordinator
+	stopCh      chan struct{}         // 停止信号
 }
 
 // NewBroker 创建一个新的消息代理
-func NewBroker(nodeID string, storeDir string, addr string) (*Broker, error) {
+func NewBroker(  addr string) (*Broker, error) {
+	if addr == "" {
+		addr = "0.0.0.0:9000" // 默认监听所有网络接口的9000端口
+	}
+
+	// 自动生成唯一的节点ID
+	nodeID := generateNodeID(addr)
+
+	// 基于节点ID生成存储目录
+	storeDir := generateStoreDir(nodeID)
+	
 	fileStore, err := store.NewFileStore(storeDir)
 	if err != nil {
 		return nil, err
@@ -47,6 +66,7 @@ func NewBroker(nodeID string, storeDir string, addr string) (*Broker, error) {
 	replicaMgr := replication.NewReplicaManager(nodeID, fileStore, addr)
 	broker := &Broker{
 		nodeID:          nodeID,
+		addr:            addr,
 		store:           fileStore,
 		replicaMgr:      replicaMgr,
 		subscribers:     make(map[string][]*Subscriber),
@@ -59,8 +79,53 @@ func NewBroker(nodeID string, storeDir string, addr string) (*Broker, error) {
 	return broker, nil
 }
 
-// 修改 Start 方法
-func (b *Broker) Start(server *network.Server, seedNodeAddr string) error {
+//  generateNodeID 根据地址和时间戳生成唯一的节点ID
+func generateNodeID(addr string) string {
+	// 使用主机名+地址+时间戳的组合生成唯一ID
+	hostname, err := os.Hostname()
+	if err != nil {
+		hostname = "unknown"
+	}
+	
+	// 移除地址中的冒号，避免在文件名等场景中出现问题
+	cleanAddr := strings.ReplaceAll(addr, ":", "-")
+	
+	// 生成唯一ID
+	timestamp := time.Now().UnixNano()
+	uniqueID := fmt.Sprintf("%s-%s-%d", hostname, cleanAddr, timestamp)
+	
+	// 使用MD5哈希生成固定长度的ID
+	hasher := md5.New()
+	hasher.Write([]byte(uniqueID))
+	hashBytes := hasher.Sum(nil)
+	
+	// 返回16进制格式的前12个字符作为节点ID
+	return fmt.Sprintf("%x", hashBytes)[:12]
+}
+
+// generateStoreDir 根据节点ID生成存储目录
+func generateStoreDir(nodeID string) string {
+	// 获取用户主目录
+	homeDir, err := os.UserHomeDir()
+	if err != nil {
+		homeDir = "/tmp" // 如果无法获取主目录，使用/tmp作为备选
+	}
+	
+	// 创建基于节点ID的存储目录
+	storeDir := filepath.Join(homeDir, ".lmq", "data", nodeID)
+	
+	// 确保目录存在
+	if err := os.MkdirAll(storeDir, 0755); err != nil {
+		log.Printf("创建存储目录失败: %v，将使用临时目录", err)
+		storeDir = filepath.Join(os.TempDir(), "lmq-data-"+nodeID)
+		os.MkdirAll(storeDir, 0755)
+	}
+	
+	log.Printf("消息存储目录: %s", storeDir)
+	return storeDir
+}
+
+func (b *Broker) Start() error {
 	// 启动复制管理器
 	if err := b.replicaMgr.Start(); err != nil {
 		return err
@@ -72,20 +137,89 @@ func (b *Broker) Start(server *network.Server, seedNodeAddr string) error {
 	// 启动重试任务
 	b.StartRetryTask(5 * time.Second)
     
-    // 注册集群消息处理器
-    b.clusterMgr.RegisterHandlers(server)
-    
-    // 加入集群
-    if err := b.clusterMgr.JoinCluster(seedNodeAddr); err != nil {
-        return fmt.Errorf("加入集群失败: %w", err)
-    }
-    
     // 启动集群管理器
 	if err := b.clusterMgr.Start(); err != nil {
 		return err
 	}
+	// 启动节点同步任务
+	go b.startNodeSyncTask(1 * time.Minute)
+
+	// 启动 TCP 服务器
+	listener, err := net.Listen("tcp", b.addr)
+	if err != nil {
+		log.Fatalf("启动服务器失败: %v", err)
+	}
+	defer listener.Close()
+
+	log.Printf("LMQ broker已启动，节点ID: %s, 监听地址: %s", b.nodeID, b.addr)
+
+	// 处理优雅退出
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+
+	// 接受连接
+	go func() {
+		for {
+			conn, err := listener.Accept()
+			if err != nil {
+				log.Printf("接受连接失败: %v", err)
+				continue
+			}
+			go b.HandleConnection(conn)
+		}
+	}()
+
+	// 等待退出信号
+	<-sigCh
+	b.stopCh <- struct{}{}
+
+	log.Println("收到退出信号，broker正在关闭...")
 
 	return nil
+}
+
+
+// 从 Consul 发现其他节点并同步到集群管理器
+func (b *Broker) syncNodesFromConsul() error {
+	services, err := b.coordinator.DiscoverService("lmq-broker")
+	if err != nil {
+		return fmt.Errorf("发现服务失败: %w", err)
+	}
+
+	// 构建节点地址映射
+	nodes := make(map[string]string)
+	for _, service := range services {
+		// 跳过自己
+		if service.ID == b.nodeID {
+			continue
+		}
+
+		// 构建节点地址
+		nodeAddr := fmt.Sprintf("%s:%d", service.Address, service.Port)
+		nodes[service.ID] = nodeAddr
+	}
+	
+	// 同步到集群管理器
+	b.clusterMgr.SyncNodes(nodes)
+	
+	return nil
+}
+
+// 启动定期同步节点信息的任务
+func (b *Broker) startNodeSyncTask(interval time.Duration) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-b.stopCh:
+			return
+		case <-ticker.C:
+			if err := b.syncNodesFromConsul(); err != nil {
+				log.Printf("同步节点信息失败: %v", err)
+			}
+		}
+	}
 }
 
 
@@ -245,9 +379,6 @@ func (b *Broker) HandleConnection(conn net.Conn) {
 			err = b.handleSubscribe(conn, msg)
 		case "ack":
 			err = b.handleAck(msg)
-		case "heartbeat", "node_join", "node_leave":
-			// 将集群相关消息转发给集群管理器处理
-			err = b.clusterMgr.HandleClusterMessage(msg)
 		default:
 			err = fmt.Errorf("未知的消息类型: %s", msg.Type)
 		}

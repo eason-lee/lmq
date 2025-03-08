@@ -13,12 +13,12 @@ import (
 
 // Partition 表示一个分区
 type Partition struct {
-	topic        string
-	id           int
-	dir          string
-	segments     []*Segment // 按基础偏移量排序的段列表
-	activeSegment *Segment  // 当前活跃的段
-	mu           sync.RWMutex
+	topic         string
+	id            int
+	dir           string
+	segments      []*Segment // 按基础偏移量排序的段列表
+	activeSegment *Segment   // 当前活跃的段
+	mu            sync.RWMutex
 }
 
 // newPartition 创建新的分区
@@ -97,8 +97,20 @@ func (p *Partition) Close() error {
 	return nil
 }
 
+// GetLatestOffset 获取分区的最新偏移量
+func (p *Partition) GetLatestOffset() (int64, error) {
+	if p.activeSegment == nil {
+		return 0, nil
+	}
 
+	// 获取活跃段的最新偏移量
+	offset, err := p.activeSegment.GetLatestOffset()
+	if err != nil {
+		return 0, fmt.Errorf("获取活跃段偏移量失败: %w", err)
+	}
 
+	return offset, nil
+}
 
 // 创建新的段
 func (p *Partition) createSegment(baseOffset int64, maxSize int64) (*Segment, error) {
@@ -201,7 +213,6 @@ func (p *Partition) loadSegment(baseOffset int64, maxSize int64) (*Segment, erro
 	return segment, nil
 }
 
-
 // CleanupSegments 清理过期的段
 func (p *Partition) CleanupSegments(retention time.Duration) error {
 	p.mu.Lock()
@@ -256,4 +267,3 @@ func (p *Partition) CleanupSegments(retention time.Duration) error {
 
 	return nil
 }
-

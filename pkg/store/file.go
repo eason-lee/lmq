@@ -316,3 +316,16 @@ func (fs *FileStore) GetPartitions(topic string) []int {
 
 	return []int{}
 }
+
+// GetLatestOffset 获取指定分区的最新偏移量
+func (fs *FileStore) GetLatestOffset(topic string, partition int) (int64, error) {
+	fs.mu.RLock()
+	p, ok := fs.partitions[topic][partition]
+	fs.mu.RUnlock()
+
+	if !ok {
+		return 0, fmt.Errorf("分区不存在: %s-%d", topic, partition)
+	}
+
+	return p.GetLatestOffset()
+}

@@ -1,16 +1,34 @@
 syntax = "proto3";
 package lmq;
 
+import "google/protobuf/timestamp.proto";
+import "google/protobuf/any.proto";
+
 option go_package = "github.com/eason-lee/lmq/proto";
 
-// 消息定义
+// 消息类型枚举
+enum MessageType {
+  UNKNOWN = 0;
+  NORMAL = 1;
+  DELAYED = 2;
+  DEAD_LETTER = 3;
+}
+
+// 响应状态枚举
+enum Status {
+  OK = 0;
+  ERROR = 1;
+}
+
+// 基础消息
 message Message {
   string id = 1;
   string topic = 2;
   bytes body = 3;
-  int64 timestamp = 4;
-  string type = 5;
-  map<string, string> data = 6;  
+  google.protobuf.Timestamp timestamp = 4;
+  MessageType type = 5;
+  map<string, google.protobuf.Any> attributes = 6;
+  int32 version = 7;
 }
 
 // 请求消息
@@ -30,24 +48,36 @@ message Request {
 message PublishRequest {
   string topic = 1;
   bytes body = 2;
+  MessageType type = 3;
+  map<string, google.protobuf.Any> attributes = 4;
+  int32 delay_seconds = 5;  // 延迟投递时间，单位秒
 }
 
 // 订阅请求
 message SubscribeRequest {
   string group_id = 1;
   repeated string topics = 2;
+  map<string, string> filters = 3;  // 消息过滤条件
+  int32 batch_size = 4;  // 批量获取消息数量
+  int32 timeout_seconds = 5;  // 长轮询超时时间
 }
 
 // 确认请求
 message AckRequest {
   string group_id = 1;
   repeated string message_ids = 2;
+  string topic = 3;
 }
 
 // 响应定义
 message Response {
-  bool success = 1;
-  string message = 2;  
-  string error = 3;    
-  map<string, string> data = 4;  
+  Status status = 1;
+  string message = 2;  // 成功或错误信息
+  google.protobuf.Any data = 3;  // 响应数据
+}
+
+// 批量消息响应
+message BatchMessagesResponse {
+  repeated Message messages = 1;
+  string next_cursor = 2;  // 用于分页
 }

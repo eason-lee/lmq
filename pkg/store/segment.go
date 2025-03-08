@@ -3,23 +3,29 @@ package store
 import (
 	"encoding/binary"
 	"fmt"
-	"io"
 	"os"
 	"path/filepath"
 	"sync"
+	"time"
 
 	"github.com/eason-lee/lmq/pkg/protocol"
 )
 
+// 错误定义
+var (
+	ErrSegmentFull = fmt.Errorf("段已满")
+)
+
 // Segment 表示一个日志段
 type Segment struct {
-	baseOffset int64     // 段的基础偏移量
-	nextOffset int64     // 下一条消息的偏移量
-	size       int64     // 当前段大小
-	maxSize    int64     // 段的最大大小
-	dataFile   *os.File  // 数据文件
-	indexFile  *os.File  // 索引文件
-	mu         sync.Mutex // 段级别的锁
+	baseOffset int64        // 段的基础偏移量
+	nextOffset int64        // 下一条消息的偏移量
+	size       int64        // 当前段大小
+	maxSize    int64        // 段的最大大小
+	dataFile   *os.File     // 数据文件
+	indexFile  *os.File     // 索引文件
+	mu         sync.RWMutex // 段级别的锁
+	index      []MessageIndex
 }
 
 // MessageIndex 消息索引记录
@@ -59,10 +65,10 @@ func newSegment(dir string, baseOffset int64, maxSize int64) (*Segment, error) {
 	return &Segment{
 		baseOffset: baseOffset,
 		nextOffset: baseOffset,
-		size:      dataInfo.Size(),
-		maxSize:   maxSize,
-		dataFile:  dataFile,
-		indexFile: indexFile,
+		size:       dataInfo.Size(),
+		maxSize:    maxSize,
+		dataFile:   dataFile,
+		indexFile:  indexFile,
 	}, nil
 }
 
@@ -71,38 +77,41 @@ func (s *Segment) Write(msg *protocol.Message) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	// 获取当前文件位置
-	position, err := s.dataFile.Seek(0, io.SeekEnd)
-	if err != nil {
-		return fmt.Errorf("获取文件位置失败: %w", err)
-	}
-
-	// 使用二进制格式序列化消息
+	// 序列化消息
 	data, err := serializeMessage(msg)
 	if err != nil {
 		return fmt.Errorf("序列化消息失败: %w", err)
 	}
 
-	// 写入消息数据
-	if _, err := s.dataFile.Write(data); err != nil {
-		return fmt.Errorf("写入消息数据失败: %w", err)
+	// 检查段大小
+	if s.size+int64(len(data)) > s.maxSize {
+		return ErrSegmentFull
 	}
 
-	// 写入索引
+	// 写入数据
+	position, err := s.dataFile.Seek(0, os.SEEK_END)
+	if err != nil {
+		return fmt.Errorf("获取文件位置失败: %w", err)
+	}
+
+	if _, err := s.dataFile.Write(data); err != nil {
+		return fmt.Errorf("写入数据失败: %w", err)
+	}
+
+	// 更新索引
+	timestamp := time.Now().UnixNano()
+	if msg.Message.Timestamp != nil {
+		timestamp = msg.Message.Timestamp.AsTime().UnixNano()
+	}
+
 	index := MessageIndex{
-		Offset:    s.nextOffset,
+		Offset:    s.baseOffset + int64(len(s.index)),
 		Position:  position,
 		Size:      int32(len(data)),
-		Timestamp: msg.Timestamp,
+		Timestamp: timestamp,
 	}
-
-	if err := s.writeIndex(&index); err != nil {
-		return fmt.Errorf("写入索引失败: %w", err)
-	}
-
-	// 更新段状态
+	s.index = append(s.index, index)
 	s.size += int64(len(data))
-	s.nextOffset++
 
 	return nil
 }
@@ -187,7 +196,6 @@ func (s *Segment) readIndexes(offset int64, count int) ([]MessageIndex, error) {
 	return indexes, nil
 }
 
-
 // writeIndex 写入索引记录
 func (s *Segment) writeIndex(index *MessageIndex) error {
 	buf := make([]byte, 28) // 8 + 8 + 4 + 8 bytes
@@ -219,7 +227,6 @@ func (s *Segment) Close() error {
 	return nil
 }
 
-
 // getLastMessageTimestamp 获取段中最后一条消息的时间戳
 func (s *Segment) getLastMessageTimestamp() (int64, error) {
 	s.mu.Lock()
@@ -245,4 +252,19 @@ func (s *Segment) getLastMessageTimestamp() (int64, error) {
 	// 解析时间戳
 	timestamp := int64(binary.BigEndian.Uint64(buf[20:28]))
 	return timestamp, nil
+}
+
+// GetLatestOffset 获取段的最新偏移量
+func (s *Segment) GetLatestOffset() (int64, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	// 如果没有消息，返回基础偏移量
+	if len(s.index) == 0 {
+		return s.baseOffset, nil
+	}
+
+	// 返回最后一条消息的偏移量
+	lastIndex := s.index[len(s.index)-1]
+	return lastIndex.Offset, nil
 }

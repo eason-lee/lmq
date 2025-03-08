@@ -177,10 +177,10 @@ func (c *Client) Subscribe(topics []string, handler func([]*Message)) error {
 				sdkMessages := make([]*Message, len(messages))
 				for i, msg := range messages {
 					sdkMessages[i] = &Message{
-						ID:        msg.ID,
+						ID:        msg.Id,
 						Topic:     msg.Topic,
 						Body:      msg.Body,
-						Timestamp: time.Unix(0, msg.Timestamp),
+						Timestamp: msg.Timestamp.AsTime(),
 					}
 				}
 				// 处理消息

@@ -18,8 +18,8 @@ type ConsulCoordinator struct {
 	mu       sync.RWMutex
 }
 
-// NewCoordinator 创建一个新的 Consul 协调器
-func NewCoordinator(address string) (*ConsulCoordinator, error) {
+// NewConsulCoordinator 创建一个新的 Consul 协调器
+func NewConsulCoordinator(address string) (*ConsulCoordinator, error) {
 	config := api.DefaultConfig()
 	config.Address = address
 

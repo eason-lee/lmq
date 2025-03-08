@@ -1,187 +1,207 @@
 package producer
 
 import (
-    "fmt"
-    "sync"
-    "time"
+	"fmt"
+	"strconv"
+	"sync"
+	"time"
 
-    "github.com/eason-lee/lmq/pkg/protocol"
-    "github.com/eason-lee/lmq/pkg/network"
+	"github.com/eason-lee/lmq/pkg/network"
+	"github.com/eason-lee/lmq/pkg/protocol"
+	pb "github.com/eason-lee/lmq/proto"
+	"google.golang.org/protobuf/types/known/anypb"
 )
 
 // ProducerConfig 生产者配置
 type ProducerConfig struct {
-    Brokers    []string      // broker 节点地址列表
-    RetryTimes int           // 发送重试次数
-    Timeout    time.Duration // 发送超时时间
+	Brokers    []string      // broker 节点地址列表
+	RetryTimes int           // 发送重试次数
+	Timeout    time.Duration // 发送超时时间
 }
 
 // Producer 消息生产者
 type Producer struct {
-    config  *ProducerConfig
-    clients map[string]*network.Client // broker地址 -> 客户端连接
-    mu      sync.RWMutex
+	config  *ProducerConfig
+	clients map[string]*network.Client // broker地址 -> 客户端连接
+	mu      sync.RWMutex
 }
 
 // SendResult 发送结果
 type SendResult struct {
-    MessageID string    // 消息ID
-    Topic     string    // 主题
-    Partition int       // 分区
-    Timestamp time.Time // 发送时间
-    Error     error     // 错误信息
+	MessageID string    // 消息ID
+	Topic     string    // 主题
+	Partition int       // 分区
+	Timestamp time.Time // 发送时间
+	Error     error     // 错误信息
 }
 
 // NewProducer 创建一个新的生产者
 func NewProducer(config *ProducerConfig) (*Producer, error) {
-    if len(config.Brokers) == 0 {
-        return nil, fmt.Errorf("至少需要一个 broker 地址")
-    }
+	if len(config.Brokers) == 0 {
+		return nil, fmt.Errorf("至少需要一个 broker 地址")
+	}
 
-    if config.RetryTimes <= 0 {
-        config.RetryTimes = 3
-    }
+	if config.RetryTimes <= 0 {
+		config.RetryTimes = 3
+	}
 
-    if config.Timeout <= 0 {
-        config.Timeout = 5 * time.Second
-    }
+	if config.Timeout <= 0 {
+		config.Timeout = 5 * time.Second
+	}
 
-    return &Producer{
-        config:  config,
-        clients: make(map[string]*network.Client),
-    }, nil
+	return &Producer{
+		config:  config,
+		clients: make(map[string]*network.Client),
+	}, nil
 }
 
 // Send 同步发送消息到指定主题
 func (p *Producer) Send(topic string, data []byte, partitionKey string) (*SendResult, error) {
-    // 选择一个可用的 broker
-    broker := p.selectBroker(topic)
-    
-    // 获取或创建到 broker 的连接
-    client, err := p.getClient(broker)
-    if err != nil {
-        return nil, fmt.Errorf("连接 broker 失败: %w", err)
-    }
+	// 选择一个可用的 broker
+	broker := p.selectBroker(topic)
 
-    // 创建消息
-    msg := protocol.NewMessage(topic, data)
-    
-    // 如果提供了分区键，设置到消息中
-    if partitionKey != "" {
-        msg.PartitionKey = partitionKey
-    }
+	// 获取或创建到 broker 的连接
+	client, err := p.getClient(broker)
+	if err != nil {
+		return nil, fmt.Errorf("连接 broker 失败: %w", err)
+	}
 
-    // 发送消息
-    var lastErr error
-    for i := 0; i < p.config.RetryTimes; i++ {
-        resp, err := client.Send("publish", msg)
-        if err == nil && resp.Success {
-            // 解析响应中的分区信息
-            partition := 0
-            if resp.Data != nil {
-                // 将 resp.Data 转换为 map[string]interface{} 类型
-                if dataMap, ok := resp.Data.(map[string]interface{}); ok {
-                    if partInfo, ok := dataMap["partition"].(float64); ok {
-                        partition = int(partInfo)
-                    }
-                }
-            }
-            
-            return &SendResult{
-                MessageID: msg.ID,
-                Topic:     topic,
-                Partition: partition,
-                Timestamp: time.Unix(0, msg.Timestamp),
-                Error:     nil,
-            }, nil
-        }
-        lastErr = err
-        time.Sleep(time.Second * time.Duration(i+1)) // 指数退避
-    }
+	// 创建消息
+	msg := protocol.NewMessage(topic, data)
 
-    return &SendResult{
-        MessageID: msg.ID,
-        Topic:     topic,
-        Error:     fmt.Errorf("发送消息失败，已重试 %d 次: %v", p.config.RetryTimes, lastErr),
-    }, lastErr
+	// 如果提供了分区键，设置到消息中
+	if partitionKey != "" {
+		msg.Message.Attributes["partition_key"] = mustPackAny(partitionKey)
+	}
+
+	// 发送消息
+	var lastErr error
+	for i := 0; i < p.config.RetryTimes; i++ {
+		resp, err := client.Send("publish", msg)
+		if err == nil && resp.Status == pb.Status_OK {
+			// 解析响应中的分区信息
+			partition := 0
+			if resp.Message != "" {
+				partition, err = strconv.Atoi(resp.Message)
+				if err != nil {
+					return nil, fmt.Errorf("解析分区信息失败: %w", err)
+				}
+			}
+
+			return &SendResult{
+				MessageID: msg.Message.Id,
+				Topic:     topic,
+				Partition: partition,
+				Timestamp: msg.Message.Timestamp.AsTime(),
+				Error:     nil,
+			}, nil
+		}
+		lastErr = err
+		time.Sleep(time.Second * time.Duration(i+1)) // 指数退避
+	}
+
+	return &SendResult{
+		MessageID: msg.Message.Id,
+		Topic:     topic,
+		Error:     fmt.Errorf("发送消息失败，已重试 %d 次: %v", p.config.RetryTimes, lastErr),
+	}, lastErr
 }
 
 // SendAsync 异步发送消息到指定主题
 func (p *Producer) SendAsync(topic string, data []byte, partitionKey string, callback func(*SendResult)) {
-    go func() {
-        result, _ := p.Send(topic, data, partitionKey)
-        if callback != nil {
-            callback(result)
-        }
-    }()
+	go func() {
+		result, _ := p.Send(topic, data, partitionKey)
+		if callback != nil {
+			callback(result)
+		}
+	}()
 }
 
 // SendBatch 批量发送消息
 func (p *Producer) SendBatch(topic string, messages [][]byte, partitionKey string) ([]*SendResult, error) {
-    results := make([]*SendResult, len(messages))
-    var wg sync.WaitGroup
-    var mu sync.Mutex
-    var hasError bool
+	results := make([]*SendResult, len(messages))
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	var hasError bool
 
-    for i, data := range messages {
-        wg.Add(1)
-        go func(idx int, msgData []byte) {
-            defer wg.Done()
-            result, err := p.Send(topic, msgData, partitionKey)
-            
-            mu.Lock()
-            results[idx] = result
-            if err != nil {
-                hasError = true
-            }
-            mu.Unlock()
-        }(i, data)
-    }
+	for i, data := range messages {
+		wg.Add(1)
+		go func(idx int, msgData []byte) {
+			defer wg.Done()
+			result, err := p.Send(topic, msgData, partitionKey)
 
-    wg.Wait()
+			mu.Lock()
+			results[idx] = result
+			if err != nil {
+				hasError = true
+			}
+			mu.Unlock()
+		}(i, data)
+	}
 
-    if hasError {
-        return results, fmt.Errorf("部分消息发送失败")
-    }
-    return results, nil
+	wg.Wait()
+
+	if hasError {
+		return results, fmt.Errorf("部分消息发送失败")
+	}
+	return results, nil
 }
 
 // selectBroker 选择一个 broker（这里先简单实现，后续可以加入负载均衡策略）
 func (p *Producer) selectBroker(topic string) string {
-    // TODO: 实现更智能的 broker 选择策略
-    return p.config.Brokers[0]
+	// TODO: 实现更智能的 broker 选择策略
+	return p.config.Brokers[0]
 }
 
 // getClient 获取或创建到指定 broker 的连接
 func (p *Producer) getClient(addr string) (*network.Client, error) {
-    p.mu.Lock()
-    defer p.mu.Unlock()
+	p.mu.Lock()
+	defer p.mu.Unlock()
 
-    if client, ok := p.clients[addr]; ok {
-        return client, nil
-    }
+	if client, ok := p.clients[addr]; ok {
+		return client, nil
+	}
 
-    client, err := network.NewClient(addr)
-    if err != nil {
-        return nil, err
-    }
+	client, err := network.NewClient(addr)
+	if err != nil {
+		return nil, err
+	}
 
-    p.clients[addr] = client
-    return client, nil
+	p.clients[addr] = client
+	return client, nil
 }
 
 // Close 关闭生产者
 func (p *Producer) Close() error {
-    p.mu.Lock()
-    defer p.mu.Unlock()
+	p.mu.Lock()
+	defer p.mu.Unlock()
 
-    var lastErr error
-    for addr, client := range p.clients {
-        if err := client.Close(); err != nil {
-            lastErr = err
-        }
-        delete(p.clients, addr)
-    }
+	var lastErr error
+	for addr, client := range p.clients {
+		if err := client.Close(); err != nil {
+			lastErr = err
+		}
+		delete(p.clients, addr)
+	}
 
-    return lastErr
+	return lastErr
+}
+
+// mustPackAny 将值打包为 Any 类型
+func mustPackAny(value interface{}) *anypb.Any {
+	var any *anypb.Any
+	var err error
+
+	switch v := value.(type) {
+	case string:
+		any, err = anypb.New(&pb.Response{Message: v})
+	default:
+		panic(fmt.Sprintf("unsupported type: %T", value))
+	}
+
+	if err != nil {
+		panic(err)
+	}
+
+	return any
 }

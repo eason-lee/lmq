@@ -3,22 +3,25 @@ package consumer
 import (
 	"fmt"
 	"log"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/eason-lee/lmq/pkg/network"
 	"github.com/eason-lee/lmq/pkg/protocol"
+	pb "github.com/eason-lee/lmq/proto"
+	"google.golang.org/protobuf/types/known/anypb"
 )
 
 // ConsumerConfig 消费者配置
 type ConsumerConfig struct {
-	Brokers      []string      // broker 节点地址列表
-	GroupID      string        // 消费者组ID
-	Topics       []string      // 订阅的主题列表
-	AutoCommit   bool          // 是否自动提交确认
+	Brokers        []string      // broker 节点地址列表
+	GroupID        string        // 消费者组ID
+	Topics         []string      // 订阅的主题列表
+	AutoCommit     bool          // 是否自动提交确认
 	CommitInterval time.Duration // 自动提交间隔
-	MaxPullRecords int         // 单次拉取的最大消息数
-	PullTimeout   time.Duration // 拉取超时时间
+	MaxPullRecords int           // 单次拉取的最大消息数
+	PullTimeout    time.Duration // 拉取超时时间
 }
 
 // Consumer 消息消费者
@@ -79,30 +82,30 @@ func (c *Consumer) Subscribe() error {
 
 	// 创建订阅请求
 	req := &protocol.Message{
-		Type:  "subscribe",
-		Topic: "", // 不需要指定单个主题，因为我们在请求体中包含了所有主题
-		Body:  nil,
-		Data: map[string]interface{}{
-			"group_id": c.config.GroupID,
-			"topics":   c.config.Topics,
+		Message: &pb.Message{
+			Type: pb.MessageType_NORMAL,
+			Attributes: map[string]*anypb.Any{
+				"group_id": mustPackAny(c.config.GroupID),
+				"topics":   mustPackAny(strings.Join(c.config.Topics, ",")),
+			},
 		},
 	}
 
 	// 发送订阅请求
-	resp, err := c.client.Send(req.Type, req)
+	resp, err := c.client.Send("subscribe", req)
 	if err != nil {
 		return fmt.Errorf("发送订阅请求失败: %w", err)
 	}
 
-	if !resp.Success {
-		return fmt.Errorf("订阅失败: %s", resp.Error)
+	if resp.Status == pb.Status_ERROR {
+		return fmt.Errorf("订阅失败: %s", resp.Message)
 	}
 
 	c.subscribed = true
 
-	// 启动消息拉取循环
+	// 启动消息接收循环，接收服务器推送的消息
 	c.wg.Add(1)
-	go c.pullMessages()
+	go c.receiveMessages()
 
 	// 如果启用了自动提交，启动自动提交循环
 	if c.config.AutoCommit && c.config.CommitInterval > 0 {
@@ -113,30 +116,64 @@ func (c *Consumer) Subscribe() error {
 	return nil
 }
 
+// receiveMessages 接收消息
+func (c *Consumer) receiveMessages() {
+	defer c.wg.Done()
+
+	for {
+		select {
+		case <-c.stopCh:
+			return
+		default:
+			// 从客户端连接接收消息
+			msg, err := c.client.Receive()
+			if err != nil {
+				log.Printf("接收消息失败: %v", err)
+				time.Sleep(time.Second) // 出错后等待一段时间再重试
+				continue
+			}
+
+			// 检查消息类型，确保是普通消息而不是控制消息
+			if msg.Message.Type != pb.MessageType_NORMAL {
+				continue
+			}
+
+			// 发送到消息通道
+			select {
+			case c.messages <- msg:
+				// 消息成功发送到通道
+			default:
+				// 通道已满，记录日志
+				log.Printf("消息通道已满，丢弃消息: %s", msg.Message.Id)
+			}
+		}
+	}
+}
+
 // Pull 拉取消息
 func (c *Consumer) Pull(timeout time.Duration) []*protocol.Message {
-    if !c.subscribed {
-        if err := c.Subscribe(); err != nil {
-            log.Printf("自动订阅失败: %v", err)
-            return nil
-        }
-    }
+	if !c.subscribed {
+		if err := c.Subscribe(); err != nil {
+			log.Printf("自动订阅失败: %v", err)
+			return nil
+		}
+	}
 
-    var messages []*protocol.Message
-    timeoutCh := time.After(timeout)
+	var messages []*protocol.Message
+	timeoutCh := time.After(timeout)
 
-    // 收集消息直到超时或达到最大消息数
-    for {
-        select {
-        case msg := <-c.messages:
-            messages = append(messages, msg)
-            if len(messages) >= c.config.MaxPullRecords {
-                return messages
-            }
-        case <-timeoutCh:
-            return messages
-        }
-    }
+	// 收集消息直到超时或达到最大消息数
+	for {
+		select {
+		case msg := <-c.messages:
+			messages = append(messages, msg)
+			if len(messages) >= c.config.MaxPullRecords {
+				return messages
+			}
+		case <-timeoutCh:
+			return messages
+		}
+	}
 }
 
 // Commit 提交消息确认
@@ -147,23 +184,23 @@ func (c *Consumer) Commit(messageIDs []string) error {
 
 	// 创建确认请求
 	req := &protocol.Message{
-		Type:  "ack",
-		Topic: "",
-		Body:  nil,
-		Data: map[string]interface{}{
-			"group_id":    c.config.GroupID,
-			"message_ids": messageIDs,
+		Message: &pb.Message{
+			Type: pb.MessageType_NORMAL,
+			Attributes: map[string]*anypb.Any{
+				"group_id":    mustPackAny(c.config.GroupID),
+				"message_ids": mustPackAny(strings.Join(messageIDs, ",")),
+			},
 		},
 	}
 
 	// 发送确认请求
-	resp, err := c.client.Send(req.Type, req)
+	resp, err := c.client.Send("ack", req)
 	if err != nil {
 		return fmt.Errorf("发送确认请求失败: %w", err)
 	}
 
-	if !resp.Success {
-		return fmt.Errorf("确认失败: %s", resp.Error)
+	if resp.Status == pb.Status_ERROR {
+		return fmt.Errorf("确认失败: %s", resp.Message)
 	}
 
 	return nil
@@ -194,83 +231,6 @@ func (c *Consumer) Close() error {
 
 	c.subscribed = false
 	return nil
-}
-
-func (c *Consumer) pullMessages() {
-    defer c.wg.Done()
-
-    for {
-        select {
-        case <-c.stopCh:
-            return
-        default:
-            // 创建拉取请求
-            req := &protocol.Message{
-                Type:  "pull",  // 修改请求类型
-                Topic: "",
-                Body:  nil,
-                Data: map[string]interface{}{
-                    "group_id":  c.config.GroupID,
-                    "topics":    c.config.Topics,
-                    "max_count": c.config.MaxPullRecords,  // 修改配置字段名
-                    "timeout":   c.config.PullTimeout.Milliseconds(),  // 修改配置字段名
-                },
-            }
-
-            // 发送拉取请求
-            resp, err := c.client.Send(req.Type, req)
-            if err != nil {
-                log.Printf("拉取消息失败: %v", err)
-                time.Sleep(time.Second) // 出错后等待一段时间再重试
-                continue
-            }
-
-            if !resp.Success {
-                log.Printf("拉取消息失败: %s", resp.Error)
-                time.Sleep(time.Second)
-                continue
-            }
-
-            // 处理响应中的消息
-            if resp.Data != nil {
-                if messagesData, ok := resp.Data.(map[string]interface{})["messages"]; ok {
-                    if messagesList, ok := messagesData.([]interface{}); ok {
-                        for _, msgData := range messagesList {
-                            if msgMap, ok := msgData.(map[string]interface{}); ok {
-                                // 构造消息对象
-                                msg := &protocol.Message{}
-                                
-                                if id, ok := msgMap["id"].(string); ok {
-                                    msg.ID = id
-                                }
-                                
-                                if topic, ok := msgMap["topic"].(string); ok {
-                                    msg.Topic = topic
-                                }
-                                
-                                if body, ok := msgMap["body"].([]byte); ok {
-                                    msg.Body = body
-                                }
-                                
-                                if timestamp, ok := msgMap["timestamp"].(float64); ok {
-                                    msg.Timestamp = int64(timestamp)
-                                }
-                                
-                                // 发送到消息通道
-                                select {
-                                case c.messages <- msg:
-                                    // 消息成功发送到通道
-                                default:
-                                    // 通道已满，记录日志
-                                    log.Printf("消息通道已满，丢弃消息: %s", msg.ID)
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
 }
 
 // autoCommitLoop 自动提交确认的循环
@@ -304,10 +264,29 @@ func (c *Consumer) autoCommitLoop() {
 			}
 		case msg := <-c.messages:
 			// 记录消息ID，等待自动提交
-			pendingMessages = append(pendingMessages, msg.ID)
-			
+			pendingMessages = append(pendingMessages, msg.Message.Id)
+
 			// 将消息放回通道，供 Pull 方法获取
 			c.messages <- msg
 		}
 	}
+}
+
+// mustPackAny 将值打包为 Any 类型
+func mustPackAny(value interface{}) *anypb.Any {
+	var any *anypb.Any
+	var err error
+
+	switch v := value.(type) {
+	case string:
+		any, err = anypb.New(&pb.Response{Message: v})
+	default:
+		panic(fmt.Sprintf("unsupported type: %T", value))
+	}
+
+	if err != nil {
+		panic(err)
+	}
+
+	return any
 }

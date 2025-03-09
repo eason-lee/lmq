@@ -11,7 +11,6 @@ import (
 	"github.com/eason-lee/lmq/pkg/protocol"
 	"github.com/eason-lee/lmq/pkg/store"
 	pb "github.com/eason-lee/lmq/proto"
-	"google.golang.org/protobuf/types/known/anypb"
 )
 
 // NodeStatus 节点状态
@@ -71,14 +70,17 @@ func (cm *ClusterManager) RegisterHandlers(server *network.Server) {
 
 // handleHeartbeatRequest 处理心跳请求
 func (cm *ClusterManager) handleHeartbeatRequest(req *pb.Request) *pb.Response {
-	// 从 Data 字段获取心跳数据
-	nodeID, ok := req.Data["node_id"]
-	if !ok {
+	// 从 request_data 字段获取心跳数据
+	if req.GetRequestData() == nil || req.GetHeartbeatData() == nil {
 		return &pb.Response{
 			Status:  pb.Status_ERROR,
-			Message: "心跳数据缺少节点ID",
+			Message: "心跳请求缺少数据",
 		}
 	}
+
+	heartbeat := req.GetHeartbeatData()
+	nodeID := heartbeat.NodeId
+	address := heartbeat.Address
 
 	// 更新节点状态
 	cm.mu.Lock()
@@ -87,15 +89,6 @@ func (cm *ClusterManager) handleHeartbeatRequest(req *pb.Request) *pb.Response {
 		node.Status = NodeStatusUp
 	} else {
 		// 新节点加入
-		address, ok := req.Data["address"]
-		if !ok {
-			cm.mu.Unlock()
-			return &pb.Response{
-				Status:  pb.Status_ERROR,
-				Message: "心跳数据缺少节点地址",
-			}
-		}
-
 		cm.nodes[nodeID] = &Node{
 			ID:       nodeID,
 			Address:  address,
@@ -113,21 +106,16 @@ func (cm *ClusterManager) handleHeartbeatRequest(req *pb.Request) *pb.Response {
 
 // handleNodeJoinRequest 处理节点加入请求
 func (cm *ClusterManager) handleNodeJoinRequest(req *pb.Request) *pb.Response {
-	nodeID, ok := req.Data["node_id"]
-	if !ok {
+	if req.GetRequestData() == nil || req.GetJoinData() == nil {
 		return &pb.Response{
 			Status:  pb.Status_ERROR,
-			Message: "加入数据缺少节点ID",
+			Message: "加入请求缺少数据",
 		}
 	}
 
-	address, ok := req.Data["address"]
-	if !ok {
-		return &pb.Response{
-			Status:  pb.Status_ERROR,
-			Message: "加入数据缺少节点地址",
-		}
-	}
+	join := req.GetJoinData()
+	nodeID := join.NodeId
+	address := join.Address
 
 	// 添加节点
 	cm.mu.Lock()
@@ -150,34 +138,30 @@ func (cm *ClusterManager) handleNodeJoinRequest(req *pb.Request) *pb.Response {
 	cm.mu.RUnlock()
 
 	// 构建响应数据
-	data, err := anypb.New(&pb.Response{
-		Status:  pb.Status_OK,
-		Message: "节点加入成功",
-		Data:    nil,
-	})
-	if err != nil {
-		return &pb.Response{
-			Status:  pb.Status_ERROR,
-			Message: "构建响应数据失败",
-		}
+	nodesData := &pb.NodesResponse{
+		Nodes: nodeAddrs,
 	}
 
 	return &pb.Response{
 		Status:  pb.Status_OK,
 		Message: "节点加入成功",
-		Data:    data,
+		ResponseData: &pb.Response_NodesData{
+			NodesData: nodesData,
+		},
 	}
 }
 
 // handleNodeLeaveRequest 处理节点离开请求
 func (cm *ClusterManager) handleNodeLeaveRequest(req *pb.Request) *pb.Response {
-	nodeID, ok := req.Data["node_id"]
-	if !ok {
+	if req.GetRequestData() == nil || req.GetLeaveData() == nil {
 		return &pb.Response{
 			Status:  pb.Status_ERROR,
-			Message: "离开数据缺少节点ID",
+			Message: "离开请求缺少数据",
 		}
 	}
+
+	leave := req.GetLeaveData()
+	nodeID := leave.NodeId
 
 	// 移除节点
 	cm.mu.Lock()
@@ -198,22 +182,23 @@ func (cm *ClusterManager) handleNodeLeaveRequest(req *pb.Request) *pb.Response {
 
 // handleReplicationRequest 处理复制请求
 func (cm *ClusterManager) handleReplicationRequest(req *pb.Request) *pb.Response {
-	// 从 publish_data 字段获取复制数据
-	if req.PublishData == nil {
+	// 从 request_data 字段获取复制数据
+	if req.GetRequestData() == nil || req.GetPublishData() == nil {
 		return &pb.Response{
 			Status:  pb.Status_ERROR,
 			Message: "复制请求缺少数据",
 		}
 	}
 
-	topic := req.PublishData.Topic
+	publish := req.GetPublishData()
+	topic := publish.Topic
 	pbMessages := []*pb.Message{
 		{
 			Id:         fmt.Sprintf("%d", time.Now().UnixNano()), // 生成唯一ID
 			Topic:      topic,
-			Body:       req.PublishData.Body,
+			Body:       publish.Body,
 			Type:       pb.MessageType_NORMAL,
-			Attributes: req.PublishData.Attributes,
+			Attributes: publish.Attributes,
 		},
 	}
 
@@ -371,11 +356,13 @@ func (cm *ClusterManager) sendHeartbeats() {
 			// 创建心跳请求
 			heartbeatReq := &pb.Request{
 				Type: "heartbeat",
-				Data: map[string]string{
-					"node_id": cm.localNodeID,
-					"address": cm.localAddr,
-					"status":  string(NodeStatusUp),
-					"time":    fmt.Sprintf("%d", time.Now().UnixNano()),
+				RequestData: &pb.Request_HeartbeatData{
+					HeartbeatData: &pb.HeartbeatRequest{
+						NodeId:  cm.localNodeID,
+						Address: cm.localAddr,
+						Status:  string(NodeStatusUp),
+						Time:    time.Now().UnixNano(),
+					},
 				},
 			}
 
@@ -705,10 +692,12 @@ func (cm *ClusterManager) replicateToNode(nodeID string, topic string, partition
 	// 构建复制请求
 	replicationReq := &pb.Request{
 		Type: "replication",
-		PublishData: &pb.PublishRequest{
-			Topic: topic,
-			Body:  pbMessages[0].Body,
-			Type:  pb.MessageType_NORMAL,
+		RequestData: &pb.Request_PublishData{
+			PublishData: &pb.PublishRequest{
+				Topic: topic,
+				Body:  pbMessages[0].Body,
+				Type:  pb.MessageType_NORMAL,
+			},
 		},
 	}
 

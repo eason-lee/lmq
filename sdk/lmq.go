@@ -6,6 +6,7 @@ import (
 
 	"github.com/eason-lee/lmq/pkg/consumer"
 	"github.com/eason-lee/lmq/pkg/producer"
+	"github.com/eason-lee/lmq/pkg/protocol"
 )
 
 // Config LMQ SDK 配置
@@ -22,7 +23,7 @@ type Config struct {
 	AutoCommit     bool          // 是否自动提交确认
 	CommitInterval time.Duration // 自动提交间隔
 	MaxPullRecords int           // 单次拉取的最大消息数
-	PullTimeout    time.Duration // 拉取超时时间
+	PullInterval    time.Duration // 拉取间隔
 }
 
 // Client LMQ 客户端
@@ -32,13 +33,6 @@ type Client struct {
 	consumer *consumer.Consumer
 }
 
-// Message 消息
-type Message struct {
-	ID        string    // 消息ID
-	Topic     string    // 主题
-	Body      []byte    // 消息内容
-	Timestamp time.Time // 时间戳
-}
 
 // SendResult 发送结果
 type SendResult struct {
@@ -68,8 +62,8 @@ func NewClient(config *Config) (*Client, error) {
 		config.MaxPullRecords = 100
 	}
 
-	if config.PullTimeout <= 0 {
-		config.PullTimeout = 5 * time.Second
+	if config.PullInterval <= 0 {
+		config.PullInterval = 5 * time.Second
 	}
 
 	return &Client{
@@ -156,38 +150,17 @@ func (c *Client) SendBatch(topic string, messages [][]byte) ([]*SendResult, erro
 }
 
 // Subscribe 订阅主题并消费消息
-func (c *Client) Subscribe(topics []string, handler func([]*Message)) error {
+func (c *Client) Subscribe(topics []string, handler func([]*protocol.Message)) error {
 	cons, err := c.getConsumer(topics)
 	if err != nil {
 		return err
 	}
 
 	// 订阅主题
-	if err := cons.Subscribe(); err != nil {
+	if err := cons.Subscribe(handler); err != nil {
 		return fmt.Errorf("订阅主题失败: %w", err)
 	}
 
-	// 启动消费循环
-	go func() {
-		for {
-			// 拉取消息
-			messages := cons.Pull(c.config.PullTimeout)
-			if len(messages) > 0 {
-				// 转换消息格式
-				sdkMessages := make([]*Message, len(messages))
-				for i, msg := range messages {
-					sdkMessages[i] = &Message{
-						ID:        msg.Id,
-						Topic:     msg.Topic,
-						Body:      msg.Body,
-						Timestamp: msg.Timestamp.AsTime(),
-					}
-				}
-				// 处理消息
-				handler(sdkMessages)
-			}
-		}
-	}()
 
 	return nil
 }
@@ -258,7 +231,7 @@ func (c *Client) getConsumer(topics []string) (*consumer.Consumer, error) {
 		AutoCommit:     c.config.AutoCommit,
 		CommitInterval: c.config.CommitInterval,
 		MaxPullRecords: c.config.MaxPullRecords,
-		PullTimeout:    c.config.PullTimeout,
+		PullInterval:    c.config.PullInterval,
 	}
 
 	// 创建消费者

@@ -3,10 +3,8 @@ package broker
 import (
 	"context"
 	"crypto/md5"
-	"encoding/binary"
 	"fmt"
 	"log"
-	"net"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -21,8 +19,8 @@ import (
 	"github.com/eason-lee/lmq/pkg/protocol"
 	"github.com/eason-lee/lmq/pkg/store"
 	pb "github.com/eason-lee/lmq/proto"
-	"google.golang.org/protobuf/proto"
-	"google.golang.org/protobuf/types/known/anypb"
+	"github.com/google/uuid"
+	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
 // Subscriber 表示一个订阅者
@@ -40,7 +38,7 @@ type Subscriber struct {
 type Broker struct {
 	nodeID          string
 	addr            string
-	store           *store.FileStore
+	store           store.Store
 	subscribers     map[string][]*Subscriber // 主题 -> 订阅者列表
 	mu              sync.RWMutex
 	unackedMessages map[string]*protocol.Message // 消息ID -> 消息
@@ -150,8 +148,6 @@ func NewBroker(addr string) (*Broker, error) {
 		return nil, fmt.Errorf("创建协调器失败: %w", err)
 	}
 
-	server := network.NewServer(addr)
-
 	broker := &Broker{
 		nodeID:          nodeID,
 		addr:            addr,
@@ -160,9 +156,14 @@ func NewBroker(addr string) (*Broker, error) {
 		unackedMessages: make(map[string]*protocol.Message),
 		coordinator:     consulCoord,
 		stopCh:          make(chan struct{}),
-		server:          server,
 		delayedMsgs:     NewDelayedMessageQueue(),
 	}
+
+	server, err := network.NewServer(addr, broker)
+	if err != nil {
+		return nil, fmt.Errorf("创建网络服务器失败: %w", err)
+	}
+	broker.server = server
 
 	broker.clusterMgr = cluster.NewClusterManager(nodeID, addr, fileStore, consulCoord)
 	broker.clusterMgr.RegisterHandlers(server)
@@ -197,210 +198,175 @@ func (b *Broker) Start() error {
 }
 
 // HandlePublish 处理发布请求
-func (b *Broker) HandlePublish(ctx context.Context, req *pb.PublishRequest) (*pb.Response, error) {
-	var msg *protocol.Message
-
-	// 根据请求类型创建消息
-	if req.DelaySeconds > 0 {
-		msg = protocol.NewDelayedMessage(req.Topic, req.Body, req.DelaySeconds)
-	} else {
-		msg = protocol.NewMessage(req.Topic, req.Body)
+func (b *Broker) HandlePublish(ctx context.Context, req *pb.PublishRequest) error {
+	// 检查 topic 是否存在
+	if err := b.checkTopic(req.Topic); err != nil {
+		return err
 	}
 
-	// 设置消息属性
-	msg.Message.Type = req.Type
-	for k, v := range req.Attributes {
-		msg.Message.Attributes[k] = v
+	// 构造消息
+	msg := &protocol.Message{
+		Message: &pb.Message{
+			Id:         uuid.New().String(),
+			Topic:      req.Topic,
+			Body:       req.Body,
+			Type:       req.Type,
+			Attributes: req.Attributes,
+			Timestamp:  timestamppb.New(time.Now()),
+		},
 	}
 
-	// 处理延迟消息
-	if msg.Message.Type == pb.MessageType_DELAYED {
-		b.delayedMsgs.Add(msg)
-		return &pb.Response{
-			Status:  pb.Status_OK,
-			Message: "延迟消息已接收",
-		}, nil
-	}
-
-	// 选择分区并保存消息
-	partition, err := b.clusterMgr.SelectPartition(req.Topic, msg.Message.Id)
+	// 获取分区
+	partition, err := b.coordinator.GetPartition(ctx, req.Topic)
 	if err != nil {
-		return nil, fmt.Errorf("选择分区失败: %w", err)
+		return fmt.Errorf("获取分区失败: %w", err)
 	}
 
-	if err := b.store.Write(req.Topic, partition, []*protocol.Message{msg}); err != nil {
-		return nil, fmt.Errorf("保存消息失败: %w", err)
+	// 写入消息
+	if err := b.store.Write(req.Topic, partition.ID, []*protocol.Message{msg}); err != nil {
+		return fmt.Errorf("写入消息失败: %w", err)
 	}
 
-	// 复制到其他节点
-	if err := b.clusterMgr.ReplicateMessages(req.Topic, partition, []*protocol.Message{msg}); err != nil {
-		return nil, fmt.Errorf("复制消息失败: %w", err)
-	}
-
-	// 分发消息给订阅者
-	b.deliverMessage(msg)
-
-	return &pb.Response{
-		Status:  pb.Status_OK,
-		Message: "消息发布成功",
-	}, nil
+	return nil
 }
 
 // HandleSubscribe 处理订阅请求
-func (b *Broker) HandleSubscribe(ctx context.Context, req *pb.SubscribeRequest) (*pb.Response, error) {
-	sub := &Subscriber{
-		ID:        fmt.Sprintf("%s-%s", req.GroupId, generateNodeID("")),
-		GroupID:   req.GroupId,
-		Topics:    req.Topics,
-		Filters:   req.Filters,
-		BatchSize: req.BatchSize,
-		Timeout:   time.Duration(req.TimeoutSeconds) * time.Second,
-		Ch:        make(chan *protocol.Message, 100),
+func (b *Broker) HandleSubscribe(ctx context.Context, req *pb.SubscribeRequest) error {
+	// 检查 group_id 是否为空
+	if req.GroupId == "" {
+		return fmt.Errorf("group_id 不能为空")
 	}
 
-	b.mu.Lock()
+	// 检查 topics 是否为空
+	if len(req.Topics) == 0 {
+		return fmt.Errorf("topics 不能为空")
+	}
+
+	// 检查每个 topic 是否存在
 	for _, topic := range req.Topics {
-		b.subscribers[topic] = append(b.subscribers[topic], sub)
+		if err := b.checkTopic(topic); err != nil {
+			return err
+		}
 	}
-	b.mu.Unlock()
 
-	// 启动消息投递协程
-	go b.handleSubscriber(sub)
+	// 注册消费者组
+	if err := b.coordinator.RegisterConsumer(ctx, req.GroupId, req.Topics); err != nil {
+		return fmt.Errorf("注册消费者组失败: %w", err)
+	}
 
+	return nil
+}
+
+// HandlePull 处理拉取请求
+func (b *Broker) HandlePull(ctx context.Context, req *pb.PullRequest) (*pb.Response, error) {
+	// 检查 group_id 是否为空
+	if req.GroupId == "" {
+		return nil, fmt.Errorf("group_id 不能为空")
+	}
+
+	// 检查 topic 是否为空
+	if req.Topic == "" {
+		return nil, fmt.Errorf("topic 不能为空")
+	}
+
+	// 检查 topic 是否存在
+	if err := b.checkTopic(req.Topic); err != nil {
+		return nil, err
+	}
+
+	// 获取消费者组的消费位置
+	offset, err := b.coordinator.GetConsumerOffset(ctx, req.GroupId, req.Topic)
+	if err != nil {
+		return nil, fmt.Errorf("获取消费位置失败: %w", err)
+	}
+
+	// 获取消费者组的分区
+	partition, err := b.coordinator.GetConsumerPartition(ctx, req.GroupId, req.Topic)
+	if err != nil {
+		return nil, fmt.Errorf("获取分区失败: %w", err)
+	}
+
+	// 读取消息
+	messages, err := b.store.Read(req.Topic, partition, offset, int(req.MaxMessages))
+	if err != nil {
+		return nil, fmt.Errorf("读取消息失败: %w", err)
+	}
+
+	// 如果没有消息，返回空响应
+	if len(messages) == 0 {
+		return &pb.Response{
+			Status:  pb.Status_OK,
+			Message: "没有新消息",
+		}, nil
+	}
+
+	// 转换消息格式
+	pbMessages := make([]*pb.Message, len(messages))
+	for i, msg := range messages {
+		pbMessages[i] = msg.Message
+	}
+
+	// 构造响应
 	return &pb.Response{
 		Status:  pb.Status_OK,
-		Message: "订阅成功",
+		Message: "拉取消息成功",
+		ResponseData: &pb.Response_BatchMessagesData{
+			BatchMessagesData: &pb.BatchMessagesResponse{
+				Messages: pbMessages,
+			},
+		},
 	}, nil
-}
-
-// handleSubscriber 处理订阅者的消息投递
-func (b *Broker) handleSubscriber(sub *Subscriber) {
-	var batch []*protocol.Message
-	ticker := time.NewTicker(sub.Timeout)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case msg := <-sub.Ch:
-			// 检查消息是否符合过滤条件
-			if !b.matchFilters(msg, sub.Filters) {
-				continue
-			}
-
-			batch = append(batch, msg)
-			if int32(len(batch)) >= sub.BatchSize {
-				b.deliverBatch(sub, batch)
-				batch = nil
-			}
-
-		case <-ticker.C:
-			if len(batch) > 0 {
-				b.deliverBatch(sub, batch)
-				batch = nil
-			}
-
-		case <-b.stopCh:
-			return
-		}
-	}
-}
-
-// matchFilters 检查消息是否符合过滤条件
-func (b *Broker) matchFilters(msg *protocol.Message, filters map[string]string) bool {
-	if len(filters) == 0 {
-		return true
-	}
-
-	for key, value := range filters {
-		attr, exists := msg.Message.Attributes[key]
-		if !exists {
-			return false
-		}
-
-		var resp pb.Response
-		if err := attr.UnmarshalTo(&resp); err != nil {
-			return false
-		}
-
-		if resp.Message != value {
-			return false
-		}
-	}
-
-	return true
-}
-
-// deliverBatch 投递一批消息
-func (b *Broker) deliverBatch(sub *Subscriber, batch []*protocol.Message) {
-	resp := &pb.BatchMessagesResponse{
-		Messages: make([]*pb.Message, len(batch)),
-	}
-
-	for i, msg := range batch {
-		resp.Messages[i] = msg.Message
-
-		// 记录未确认的消息
-		b.unackedMu.Lock()
-		b.unackedMessages[msg.Message.Id] = msg
-		b.unackedMu.Unlock()
-	}
-
-	// 将响应序列化并发送给订阅者
-	if data, err := anypb.New(resp); err == nil {
-		_ = &pb.Response{
-			Status: pb.Status_OK,
-			Data:   data,
-		}
-		// TODO: 通过网络发送response给订阅者
-	}
 }
 
 // HandleAck 处理确认请求
-func (b *Broker) HandleAck(ctx context.Context, req *pb.AckRequest) (*pb.Response, error) {
-	b.unackedMu.Lock()
-	defer b.unackedMu.Unlock()
-
-	for _, msgID := range req.MessageIds {
-		delete(b.unackedMessages, msgID)
+func (b *Broker) HandleAck(ctx context.Context, req *pb.AckRequest) error {
+	// 检查 group_id 是否为空
+	if req.GroupId == "" {
+		return fmt.Errorf("group_id 不能为空")
 	}
 
-	return &pb.Response{
-		Status:  pb.Status_OK,
-		Message: "消息确认成功",
-	}, nil
-}
-
-// deliverMessage 投递消息给订阅者
-func (b *Broker) deliverMessage(msg *protocol.Message) {
-	b.mu.RLock()
-	subs := b.subscribers[msg.Message.Topic]
-	b.mu.RUnlock()
-
-	for _, sub := range subs {
-		select {
-		case sub.Ch <- msg:
-			// 消息发送成功
-		default:
-			// 如果订阅者的通道已满，将消息转为死信
-			deadMsg := msg.ToDeadLetter("订阅者队列已满")
-			if err := b.handleDeadLetter(deadMsg); err != nil {
-				log.Printf("处理死信消息失败: %v", err)
-			}
-		}
+	// 检查 topic 是否为空
+	if req.Topic == "" {
+		return fmt.Errorf("topic 不能为空")
 	}
-}
 
-// handleDeadLetter 处理死信消息
-func (b *Broker) handleDeadLetter(msg *protocol.Message) error {
-	deadLetterTopic := fmt.Sprintf("%s.deadletter", msg.Message.Topic)
+	// 检查 message_ids 是否为空
+	if len(req.MessageIds) == 0 {
+		return fmt.Errorf("message_ids 不能为空")
+	}
 
-	partition, err := b.clusterMgr.SelectPartition(deadLetterTopic, msg.Message.Id)
+	// 检查 topic 是否存在
+	if err := b.checkTopic(req.Topic); err != nil {
+		return err
+	}
+
+	// 获取最后一条消息的 offset
+	lastOffset, err := b.store.GetOffset(req.Topic, req.MessageIds[len(req.MessageIds)-1])
 	if err != nil {
-		return fmt.Errorf("选择死信队列分区失败: %w", err)
+		return fmt.Errorf("获取消息 offset 失败: %w", err)
 	}
 
-	if err := b.store.Write(deadLetterTopic, partition, []*protocol.Message{msg}); err != nil {
-		return fmt.Errorf("保存死信消息失败: %w", err)
+	// 提交消费位置
+	if err := b.coordinator.CommitOffset(ctx, req.GroupId, req.Topic, lastOffset+1); err != nil {
+		return fmt.Errorf("提交消费位置失败: %w", err)
+	}
+
+	return nil
+}
+
+// checkTopic 检查 topic 是否存在
+func (b *Broker) checkTopic(topic string) error {
+	if topic == "" {
+		return fmt.Errorf("topic 不能为空")
+	}
+
+	exists, err := b.coordinator.TopicExists(context.Background(), topic)
+	if err != nil {
+		return fmt.Errorf("检查 topic 是否存在失败: %w", err)
+	}
+
+	if !exists {
+		return fmt.Errorf("topic %s 不存在", topic)
 	}
 
 	return nil
@@ -420,7 +386,7 @@ func (b *Broker) StartDelayedMessageProcessor(interval time.Duration) {
 						Body:  msg.Message.Body,
 						Type:  pb.MessageType_NORMAL,
 					}
-					if _, err := b.HandlePublish(context.Background(), req); err != nil {
+					if err := b.HandlePublish(context.Background(), req); err != nil {
 						log.Printf("投递延迟消息失败: %v", err)
 						// 重新加入延迟队列
 						b.delayedMsgs.Add(msg)
@@ -435,8 +401,8 @@ func (b *Broker) StartDelayedMessageProcessor(interval time.Duration) {
 }
 
 // 从 Consul 发现其他节点并同步到集群管理器
-func (b *Broker) syncNodesFromConsul() error {
-	services, err := b.coordinator.DiscoverService("lmq-broker")
+func (b *Broker) syncNodesFromConsul(ctx context.Context) error {
+	services, err := b.coordinator.DiscoverService(ctx, "lmq-broker")
 	if err != nil {
 		return fmt.Errorf("发现服务失败: %w", err)
 	}
@@ -461,7 +427,7 @@ func (b *Broker) syncNodesFromConsul() error {
 }
 
 // 启动定期同步节点信息的任务
-func (b *Broker) startNodeSyncTask(interval time.Duration) {
+func (b *Broker) startNodeSyncTask(ctx context.Context, interval time.Duration) {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
@@ -470,322 +436,9 @@ func (b *Broker) startNodeSyncTask(interval time.Duration) {
 		case <-b.stopCh:
 			return
 		case <-ticker.C:
-			if err := b.syncNodesFromConsul(); err != nil {
+			if err := b.syncNodesFromConsul(ctx); err != nil {
 				log.Printf("同步节点信息失败: %v", err)
 			}
 		}
 	}
-}
-
-// Publish 发布消息到指定主题
-func (b *Broker) Publish(topic string, data []byte) (*protocol.Message, error) {
-	// 创建消息
-	msg := protocol.NewMessage(topic, data)
-
-	// 选择分区
-	partition, err := b.clusterMgr.SelectPartition(topic, msg.Message.Id)
-	if err != nil {
-		return nil, fmt.Errorf("选择分区失败: %w", err)
-	}
-
-	// 保存消息到分区
-	if err := b.store.Write(topic, partition, []*protocol.Message{msg}); err != nil {
-		return nil, fmt.Errorf("保存消息失败: %w", err)
-	}
-
-	// 复制到其他节点
-	if err := b.clusterMgr.ReplicateMessages(topic, partition, []*protocol.Message{msg}); err != nil {
-		return nil, fmt.Errorf("复制消息失败: %w", err)
-	}
-
-	// 分发消息给订阅者
-	b.mu.RLock()
-	subs := b.subscribers[topic]
-	b.mu.RUnlock()
-
-	for _, sub := range subs {
-		// 非阻塞发送，避免一个慢订阅者阻塞整个系统
-		select {
-		case sub.Ch <- msg:
-			// 消息发送成功
-		default:
-			// 订阅者的通道已满，可以记录日志或采取其他措施
-			fmt.Printf("订阅者 %s 的通道已满，消息 %s 未能发送\n", sub.ID, msg.Message.Id)
-		}
-	}
-
-	return msg, nil
-}
-
-// Subscribe 订阅指定主题
-func (b *Broker) Subscribe(subID string, topics []string, bufSize int) (*Subscriber, error) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-
-	// 创建订阅者
-	sub := &Subscriber{
-		ID:     subID,
-		Topics: topics,
-		Ch:     make(chan *protocol.Message, bufSize),
-	}
-
-	// 添加到订阅列表
-	for _, topic := range topics {
-		b.subscribers[topic] = append(b.subscribers[topic], sub)
-	}
-
-	return sub, nil
-}
-
-// Unsubscribe 取消订阅
-func (b *Broker) Unsubscribe(subID string) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-
-	// 从所有主题中移除该订阅者
-	for topic, subs := range b.subscribers {
-		var newSubs []*Subscriber
-		for _, sub := range subs {
-			if sub.ID != subID {
-				newSubs = append(newSubs, sub)
-			}
-		}
-		b.subscribers[topic] = newSubs
-	}
-}
-
-// AckMessage 添加确认消息的方法
-func (b *Broker) AckMessage(messageID string) {
-	b.unackedMu.Lock()
-	defer b.unackedMu.Unlock()
-
-	delete(b.unackedMessages, messageID)
-}
-
-// RetryUnackedMessages 添加重试未确认消息的方法
-func (b *Broker) RetryUnackedMessages() {
-	b.unackedMu.RLock()
-	messages := make([]*protocol.Message, 0, len(b.unackedMessages))
-	for _, msg := range b.unackedMessages {
-		messages = append(messages, msg)
-	}
-	b.unackedMu.RUnlock()
-
-	for _, msg := range messages {
-		// 重新发布消息
-		b.Publish(msg.Message.Topic, msg.Message.Body)
-	}
-}
-
-// StartRetryTask 启动定时重试任务
-func (b *Broker) StartRetryTask(interval time.Duration) {
-	ticker := time.NewTicker(interval)
-	go func() {
-		for range ticker.C {
-			b.RetryUnackedMessages()
-		}
-	}()
-}
-
-// handlePublish 处理发布消息
-func (b *Broker) handlePublish(msg *protocol.Message) error {
-	// 选择分区
-	partition, err := b.clusterMgr.SelectPartition(msg.Message.Topic, msg.Message.Id)
-	if err != nil {
-		return fmt.Errorf("选择分区失败: %w", err)
-	}
-
-	// 写入存储
-	if err := b.store.Write(msg.Message.Topic, partition, []*protocol.Message{msg}); err != nil {
-		return fmt.Errorf("存储消息失败: %w", err)
-	}
-
-	// 复制到其他节点
-	if err := b.clusterMgr.ReplicateMessages(msg.Message.Topic, partition, []*protocol.Message{msg}); err != nil {
-		return fmt.Errorf("复制消息失败: %w", err)
-	}
-
-	return nil
-}
-
-// selectPartition 选择消息应该发送到的分区
-func (b *Broker) selectPartition(topic string, messageID string) int {
-	// 使用集群管理器选择分区
-	partition, err := b.clusterMgr.SelectPartition(topic, messageID)
-	if err != nil {
-		log.Printf("选择分区失败: %v，使用默认分区0", err)
-		return 0
-	}
-	return partition
-}
-
-// getPartitionCount 获取主题的分区数量
-func (b *Broker) getPartitionCount(topic string) int {
-	// 从协调器获取分区数量
-	count, err := b.coordinator.GetTopicPartitionCount(topic)
-	if err != nil {
-		log.Printf("获取主题分区数量失败: %v", err)
-		return 1 // 默认返回1个分区
-	}
-	return count
-}
-
-// handleSubscribe 处理订阅请求
-func (b *Broker) handleSubscribe(conn net.Conn, msg *protocol.Message) error {
-	// 从消息属性中提取订阅信息
-	attrs := msg.Message.Attributes
-
-	// 提取消费者组ID
-	groupIDAttr, exists := attrs["group_id"]
-	if !exists {
-		return fmt.Errorf("必须提供有效的消费者组ID")
-	}
-	var groupIDResp pb.Response
-	if err := groupIDAttr.UnmarshalTo(&groupIDResp); err != nil {
-		return fmt.Errorf("解析消费者组ID失败: %w", err)
-	}
-	groupID := groupIDResp.Message
-
-	// 提取主题列表
-	topicsAttr, exists := attrs["topics"]
-	if !exists {
-		return fmt.Errorf("必须提供主题列表")
-	}
-	var topicsResp pb.Response
-	if err := topicsAttr.UnmarshalTo(&topicsResp); err != nil {
-		return fmt.Errorf("解析主题列表失败: %w", err)
-	}
-	topics := strings.Split(topicsResp.Message, ",")
-
-	if len(topics) == 0 {
-		return fmt.Errorf("至少需要订阅一个有效主题")
-	}
-
-	// 创建唯一的订阅者ID
-	subID := fmt.Sprintf("%s-%s-%d", groupID, conn.RemoteAddr().String(), time.Now().UnixNano())
-
-	// 创建订阅者
-	sub, err := b.Subscribe(subID, topics, 1000) // 使用1000作为缓冲区大小
-	if err != nil {
-		return fmt.Errorf("创建订阅失败: %w", err)
-	}
-
-	// 启动一个协程来处理消息推送
-	go func() {
-		defer b.Unsubscribe(subID)
-
-		for msg := range sub.Ch {
-			// 将消息转换为Protobuf格式
-			pbMsg := &pb.Message{
-				Id:        msg.Message.Id,
-				Topic:     msg.Message.Topic,
-				Body:      msg.Message.Body,
-				Timestamp: msg.Message.Timestamp,
-				Type:      msg.Message.Type,
-			}
-
-			// 序列化消息
-			data, err := proto.Marshal(pbMsg)
-			if err != nil {
-				log.Printf("序列化消息失败: %v", err)
-				continue
-			}
-
-			// 准备长度前缀
-			lenBuf := make([]byte, 4)
-			binary.BigEndian.PutUint32(lenBuf, uint32(len(data)))
-
-			// 发送消息
-			b.unackedMu.Lock()
-			b.unackedMessages[msg.Message.Id] = msg // 添加到未确认消息列表
-			b.unackedMu.Unlock()
-
-			// 使用互斥锁保护写操作
-			var mu sync.Mutex
-			mu.Lock()
-			if _, err := conn.Write(lenBuf); err != nil {
-				mu.Unlock()
-				log.Printf("发送消息长度失败: %v", err)
-				return
-			}
-
-			if _, err := conn.Write(data); err != nil {
-				mu.Unlock()
-				log.Printf("发送消息内容失败: %v", err)
-				return
-			}
-			mu.Unlock()
-		}
-	}()
-
-	// 发送成功响应
-	resp := &pb.Response{
-		Status:  pb.Status_OK,
-		Message: "订阅成功",
-	}
-
-	// 序列化响应
-	respData, err := proto.Marshal(resp)
-	if err != nil {
-		return fmt.Errorf("序列化响应失败: %w", err)
-	}
-
-	// 准备长度前缀
-	lenBuf := make([]byte, 4)
-	binary.BigEndian.PutUint32(lenBuf, uint32(len(respData)))
-
-	// 发送响应
-	if _, err := conn.Write(lenBuf); err != nil {
-		return fmt.Errorf("发送响应长度失败: %w", err)
-	}
-
-	if _, err := conn.Write(respData); err != nil {
-		return fmt.Errorf("发送响应内容失败: %w", err)
-	}
-
-	return nil
-}
-
-// handleAck 处理消息确认
-func (b *Broker) handleAck(msg *protocol.Message) error {
-	// 从消息属性中提取确认信息
-	attrs := msg.Message.Attributes
-
-	// 提取消费者组ID
-	groupIDAttr, exists := attrs["group_id"]
-	if !exists {
-		return fmt.Errorf("必须提供有效的消费者组ID")
-	}
-	var groupIDResp pb.Response
-	if err := groupIDAttr.UnmarshalTo(&groupIDResp); err != nil {
-		return fmt.Errorf("解析消费者组ID失败: %w", err)
-	}
-	groupID := groupIDResp.Message
-
-	// 提取要确认的消息ID列表
-	messageIDsAttr, exists := attrs["message_ids"]
-	if !exists {
-		return fmt.Errorf("必须提供要确认的消息ID列表")
-	}
-	var messageIDsResp pb.Response
-	if err := messageIDsAttr.UnmarshalTo(&messageIDsResp); err != nil {
-		return fmt.Errorf("解析消息ID列表失败: %w", err)
-	}
-	messageIDs := strings.Split(messageIDsResp.Message, ",")
-
-	if len(messageIDs) == 0 {
-		return fmt.Errorf("至少需要确认一个有效消息ID")
-	}
-
-	// 记录确认信息
-	log.Printf("消费者组 %s 确认了 %d 条消息", groupID, len(messageIDs))
-
-	// 从未确认消息列表中移除这些消息
-	b.unackedMu.Lock()
-	for _, msgID := range messageIDs {
-		delete(b.unackedMessages, msgID)
-	}
-	b.unackedMu.Unlock()
-
-	return nil
 }

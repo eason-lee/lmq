@@ -4,13 +4,11 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"sort"
-	"strconv"
-	"strings"
 	"sync"
 	"time"
 
 	"github.com/eason-lee/lmq/pkg/protocol"
+	pb "github.com/eason-lee/lmq/proto"
 )
 
 const (
@@ -22,27 +20,27 @@ const (
 	DataFileSuffix = ".log"
 )
 
-// FileStore 实现基于文件的消息存储
+// FileStore 文件存储实现
 type FileStore struct {
-	baseDir     string
+	dataDir     string
+	partitions  map[string]map[int]*Partition
 	mu          sync.RWMutex
-	partitions  map[string]map[int]*Partition // topic -> partition -> Partition
-	segmentSize int64                         // 每个段的最大大小
+	segmentSize int64
 }
 
-// NewFileStore 创建一个新的文件存储
-func NewFileStore(baseDir string) (*FileStore, error) {
-	if err := os.MkdirAll(baseDir, 0755); err != nil {
-		return nil, fmt.Errorf("创建存储目录失败: %w", err)
+// NewFileStore 创建新的文件存储实例
+func NewFileStore(dataDir string) (*FileStore, error) {
+	if err := os.MkdirAll(dataDir, 0755); err != nil {
+		return nil, fmt.Errorf("创建数据目录失败: %w", err)
 	}
 
 	fs := &FileStore{
-		baseDir:     baseDir,
+		dataDir:     dataDir,
 		partitions:  make(map[string]map[int]*Partition),
 		segmentSize: DefaultSegmentSize,
 	}
 
-	// 加载现有分区
+	// 加载已存在的分区
 	if err := fs.loadPartitions(); err != nil {
 		return nil, err
 	}
@@ -50,43 +48,39 @@ func NewFileStore(baseDir string) (*FileStore, error) {
 	return fs, nil
 }
 
-// 加载现有分区
+// loadPartitions 加载已存在的分区
 func (fs *FileStore) loadPartitions() error {
 	// 遍历主题目录
-	topics, err := os.ReadDir(fs.baseDir)
+	topics, err := os.ReadDir(fs.dataDir)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return nil
 		}
-		return fmt.Errorf("读取存储目录失败: %w", err)
+		return fmt.Errorf("读取数据目录失败: %w", err)
 	}
 
-	for _, topicDir := range topics {
-		if !topicDir.IsDir() {
+	for _, topic := range topics {
+		if !topic.IsDir() {
 			continue
 		}
-		topic := topicDir.Name()
 
 		// 遍历分区目录
-		partitionDirs, err := os.ReadDir(filepath.Join(fs.baseDir, topic))
+		partitionDirs, err := os.ReadDir(filepath.Join(fs.dataDir, topic.Name()))
 		if err != nil {
 			return fmt.Errorf("读取主题目录失败: %w", err)
 		}
 
-		for _, partDir := range partitionDirs {
-			if !partDir.IsDir() || !strings.HasPrefix(partDir.Name(), "partition-") {
+		for _, partitionDir := range partitionDirs {
+			if !partitionDir.IsDir() {
 				continue
 			}
 
 			// 解析分区ID
-			partIDStr := strings.TrimPrefix(partDir.Name(), "partition-")
-			partID, err := strconv.Atoi(partIDStr)
-			if err != nil {
-				continue
-			}
+			partitionID := 0
+			fmt.Sscanf(partitionDir.Name(), "%d", &partitionID)
 
 			// 加载分区
-			if err := fs.loadPartition(topic, partID); err != nil {
+			if err := fs.loadPartition(topic.Name(), partitionID); err != nil {
 				return err
 			}
 		}
@@ -95,112 +89,21 @@ func (fs *FileStore) loadPartitions() error {
 	return nil
 }
 
-// CreatePartition 创建新的分区
-func (fs *FileStore) CreatePartition(topic string, partition int) error {
-	fs.mu.Lock()
-	defer fs.mu.Unlock()
+// loadPartition 加载分区
+func (fs *FileStore) loadPartition(topic string, partitionID int) error {
+	partitionDir := filepath.Join(fs.dataDir, topic, fmt.Sprintf("%d", partitionID))
 
-	// 检查分区是否已存在
-	if _, ok := fs.partitions[topic]; ok {
-		if _, ok := fs.partitions[topic][partition]; ok {
-			return nil // 分区已存在
-		}
-	} else {
-		fs.partitions[topic] = make(map[int]*Partition)
-	}
-
-	// 创建分区目录
-	partDir := filepath.Join(fs.baseDir, topic, fmt.Sprintf("partition-%d", partition))
-	if err := os.MkdirAll(partDir, 0755); err != nil {
-		return fmt.Errorf("创建分区目录失败: %w", err)
-	}
-
-	// 创建分区对象
-	p := &Partition{
-		topic:    topic,
-		id:       partition,
-		dir:      partDir,
-		segments: make([]*Segment, 0),
-	}
-
-	// 创建初始段
-	segment, err := p.createSegment(0, fs.segmentSize)
+	// 创建分区实例
+	partition, err := NewPartition(partitionDir)
 	if err != nil {
 		return err
 	}
 
-	p.segments = append(p.segments, segment)
-	p.activeSegment = segment
-	fs.partitions[topic][partition] = p
-
-	return nil
-}
-
-// 加载分区
-func (fs *FileStore) loadPartition(topic string, partID int) error {
-	partDir := filepath.Join(fs.baseDir, topic, fmt.Sprintf("partition-%d", partID))
-
-	// 创建分区对象
-	partition := &Partition{
-		topic:    topic,
-		id:       partID,
-		dir:      partDir,
-		segments: make([]*Segment, 0),
-	}
-
-	// 加载段文件
-	files, err := os.ReadDir(partDir)
-	if err != nil {
-		return fmt.Errorf("读取分区目录失败: %w", err)
-	}
-
-	// 查找所有数据文件
-	var baseOffsets []int64
-	for _, file := range files {
-		if !file.IsDir() && strings.HasSuffix(file.Name(), DataFileSuffix) {
-			// 解析基础偏移量
-			baseOffsetStr := strings.TrimSuffix(file.Name(), DataFileSuffix)
-			baseOffset, err := strconv.ParseInt(baseOffsetStr, 10, 64)
-			if err != nil {
-				continue
-			}
-			baseOffsets = append(baseOffsets, baseOffset)
-		}
-	}
-
-	// 按基础偏移量排序
-	sort.Slice(baseOffsets, func(i, j int) bool {
-		return baseOffsets[i] < baseOffsets[j]
-	})
-
-	// 加载每个段
-	for _, baseOffset := range baseOffsets {
-		segment, err := partition.loadSegment(baseOffset, fs.segmentSize)
-		if err != nil {
-			return err
-		}
-		partition.segments = append(partition.segments, segment)
-	}
-
-	// 如果没有段，创建初始段
-	if len(partition.segments) == 0 {
-		segment, err := partition.createSegment(0, fs.segmentSize)
-		if err != nil {
-			return err
-		}
-		partition.segments = append(partition.segments, segment)
-	}
-
-	// 设置活跃段
-	partition.activeSegment = partition.segments[len(partition.segments)-1]
-
-	// 保存分区
-	fs.mu.Lock()
+	// 保存分区实例
 	if _, ok := fs.partitions[topic]; !ok {
 		fs.partitions[topic] = make(map[int]*Partition)
 	}
-	fs.partitions[topic][partID] = partition
-	fs.mu.Unlock()
+	fs.partitions[topic][partitionID] = partition
 
 	return nil
 }
@@ -222,11 +125,17 @@ func (fs *FileStore) Write(topic string, partition int, messages []*protocol.Mes
 		fs.mu.RUnlock()
 	}
 
-	return p.Write(messages)
+	// 转换消息格式
+	pbMessages := make([]*pb.Message, len(messages))
+	for i, msg := range messages {
+		pbMessages[i] = msg.Message
+	}
+
+	return p.Write(pbMessages)
 }
 
 // Read 从指定分区读取消息
-func (fs *FileStore) Read(topic string, partition int, offset int64, count int) ([]*protocol.Message, error) {
+func (fs *FileStore) Read(topic string, partition int, offset int64, maxMessages int) ([]*protocol.Message, error) {
 	fs.mu.RLock()
 	p, ok := fs.partitions[topic][partition]
 	fs.mu.RUnlock()
@@ -235,7 +144,38 @@ func (fs *FileStore) Read(topic string, partition int, offset int64, count int) 
 		return nil, fmt.Errorf("分区不存在: %s-%d", topic, partition)
 	}
 
-	return p.Read(offset, count)
+	pbMessages, err := p.Read(offset, maxMessages)
+	if err != nil {
+		return nil, err
+	}
+
+	// 转换消息格式
+	messages := make([]*protocol.Message, len(pbMessages))
+	for i, pbMsg := range pbMessages {
+		messages[i] = &protocol.Message{
+			Message: pbMsg,
+		}
+	}
+
+	return messages, nil
+}
+
+// GetOffset 获取指定消息的偏移量
+func (fs *FileStore) GetOffset(topic string, messageID string) (int64, error) {
+	fs.mu.RLock()
+	defer fs.mu.RUnlock()
+
+	// 遍历所有分区查找消息
+	if partitions, ok := fs.partitions[topic]; ok {
+		for _, p := range partitions {
+			offset, err := p.GetOffset(messageID)
+			if err == nil {
+				return offset, nil
+			}
+		}
+	}
+
+	return 0, fmt.Errorf("消息不存在: %s-%s", topic, messageID)
 }
 
 // Close 关闭存储
@@ -250,6 +190,39 @@ func (fs *FileStore) Close() error {
 			}
 		}
 	}
+
+	return nil
+}
+
+// CreatePartition 创建分区
+func (fs *FileStore) CreatePartition(topic string, partID int) error {
+	fs.mu.Lock()
+	defer fs.mu.Unlock()
+
+	// 检查分区是否已存在
+	if _, ok := fs.partitions[topic]; ok {
+		if _, ok := fs.partitions[topic][partID]; ok {
+			return fmt.Errorf("分区已存在: %s-%d", topic, partID)
+		}
+	}
+
+	// 创建分区目录
+	partitionDir := filepath.Join(fs.dataDir, topic, fmt.Sprintf("%d", partID))
+	if err := os.MkdirAll(partitionDir, 0755); err != nil {
+		return fmt.Errorf("创建分区目录失败: %w", err)
+	}
+
+	// 创建分区实例
+	partition, err := NewPartition(partitionDir)
+	if err != nil {
+		return fmt.Errorf("创建分区实例失败: %w", err)
+	}
+
+	// 保存分区实例
+	if _, ok := fs.partitions[topic]; !ok {
+		fs.partitions[topic] = make(map[int]*Partition)
+	}
+	fs.partitions[topic][partID] = partition
 
 	return nil
 }

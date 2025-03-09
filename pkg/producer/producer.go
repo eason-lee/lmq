@@ -147,10 +147,38 @@ func (p *Producer) SendBatch(topic string, messages [][]byte, partitionKey strin
 	return results, nil
 }
 
-// selectBroker 选择一个 broker（这里先简单实现，后续可以加入负载均衡策略）
+// selectBroker 选择一个 broker
 func (p *Producer) selectBroker(topic string) string {
-	// TODO: 实现更智能的 broker 选择策略
-	return p.config.Brokers[0]
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	// 获取可用的 broker 列表
+	brokers := p.config.Brokers
+	if len(brokers) == 0 {
+		return "" // 没有可用的 broker
+	}
+
+	// 检查现有连接的状态
+	var availableBrokers []string
+	for _, broker := range brokers {
+		if client, ok := p.clients[broker]; ok {
+			// 发送心跳检查连接状态
+			if _, err := client.Send("heartbeat", nil); err == nil {
+				availableBrokers = append(availableBrokers, broker)
+			}
+		} else {
+			// 没有连接的 broker 也加入可用列表，后续会尝试连接
+			availableBrokers = append(availableBrokers, broker)
+		}
+	}
+
+	if len(availableBrokers) == 0 {
+		return brokers[0] // 如果没有可用的，返回第一个
+	}
+
+	// 使用简单的轮询策略
+	// 可以基于连接数、负载等实现更复杂的策略
+	return availableBrokers[0]
 }
 
 // getClient 获取或创建到指定 broker 的连接

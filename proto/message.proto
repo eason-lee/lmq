@@ -31,17 +31,20 @@ message Message {
   int32 version = 7;
 }
 
-// 请求消息
+// 请求类型
 message Request {
   string type = 1;
-  map<string, string> data = 2;
-  
-  // 不同类型请求的特定数据
-  PublishRequest publish_data = 3;
-  SubscribeRequest subscribe_data = 4;
-  AckRequest ack_data = 5;
-  
-  // 可以根据需要添加更多特定类型的请求数据
+
+  // 不同类型的请求数据，只有一个会被设置
+  oneof request_data {
+    HeartbeatRequest heartbeat_data = 2;
+    JoinRequest join_data = 3;
+    LeaveRequest leave_data = 4;
+    PublishRequest publish_data = 5;
+    SubscribeRequest subscribe_data = 6;
+    PullRequest pull_data = 7;
+    AckRequest ack_data = 8;
+  }
 }
 
 // 发布请求
@@ -50,16 +53,24 @@ message PublishRequest {
   bytes body = 2;
   MessageType type = 3;
   map<string, google.protobuf.Any> attributes = 4;
-  int32 delay_seconds = 5;  // 延迟投递时间，单位秒
+  int32 delay_seconds = 5; // 延迟投递时间，单位秒
 }
 
 // 订阅请求
 message SubscribeRequest {
   string group_id = 1;
   repeated string topics = 2;
-  map<string, string> filters = 3;  // 消息过滤条件
-  int32 batch_size = 4;  // 批量获取消息数量
-  int32 timeout_seconds = 5;  // 长轮询超时时间
+  map<string, string> filters = 3; // 消息过滤条件
+  int32 batch_size = 4;            // 批量获取消息数量
+  int32 timeout_seconds = 5;       // 长轮询超时时间
+}
+
+// 拉取请求
+message PullRequest {
+  string group_id = 1;
+  string topic = 2;
+  int32 max_messages = 3; // 最大拉取消息数
+  int64 timeout_ms = 4;   // 等待超时时间（毫秒）
 }
 
 // 确认请求
@@ -69,15 +80,46 @@ message AckRequest {
   string topic = 3;
 }
 
-// 响应定义
+// 响应
 message Response {
   Status status = 1;
-  string message = 2;  // 成功或错误信息
-  google.protobuf.Any data = 3;  // 响应数据
+  string message = 2;
+  oneof response_data {
+    BatchMessagesResponse batch_messages_data = 3;
+    NodesResponse nodes_data = 4;
+    MessageResponse message_data = 5;
+  }
+}
+
+// 消息响应
+message MessageResponse {
+  Message message = 1;
 }
 
 // 批量消息响应
 message BatchMessagesResponse {
   repeated Message messages = 1;
-  string next_cursor = 2;  // 用于分页
+  string next_cursor = 2; // 用于分页
+}
+
+// 心跳请求
+message HeartbeatRequest {
+  string node_id = 1;
+  string address = 2;
+  string status = 3;
+  int64 time = 4;
+}
+
+// 节点加入请求
+message JoinRequest {
+  string node_id = 1;
+  string address = 2;
+}
+
+// 节点离开请求
+message LeaveRequest { string node_id = 1; }
+
+// 节点列表响应
+message NodesResponse {
+  map<string, string> nodes = 1; // 节点ID -> 地址
 }

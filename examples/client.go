@@ -5,6 +5,7 @@ import (
 	"log"
 	"time"
 
+	"github.com/eason-lee/lmq/pkg/protocol"
 	"github.com/eason-lee/lmq/sdk"
 )
 
@@ -18,7 +19,7 @@ func main() {
 		AutoCommit:     true,
 		CommitInterval: 5 * time.Second,
 		MaxPullRecords: 100,
-		PullTimeout:    1 * time.Second,
+		PullInterval:    1 * time.Second,
 	}
 
 	client, err := lmq.NewClient(config)
@@ -28,10 +29,10 @@ func main() {
 	defer client.Close()
 
 	// 订阅主题
-	err = client.Subscribe([]string{"test-topic"}, func(messages []*lmq.Message) {
+	err = client.Subscribe([]string{"test-topic"}, func(messages []*protocol.Message) {
 		for _, msg := range messages {
 			fmt.Printf("收到消息: ID=%s, 主题=%s, 内容=%s, 时间=%v\n",
-				msg.ID, msg.Topic, string(msg.Body), msg.Timestamp)
+				msg.Id, msg.Topic, string(msg.Body), msg.Timestamp)
 		}
 	})
 	if err != nil {

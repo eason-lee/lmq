@@ -3,7 +3,6 @@ package consumer
 import (
 	"fmt"
 	"log"
-	"strings"
 	"sync"
 	"time"
 
@@ -21,7 +20,7 @@ type ConsumerConfig struct {
 	AutoCommit     bool          // 是否自动提交确认
 	CommitInterval time.Duration // 自动提交间隔
 	MaxPullRecords int           // 单次拉取的最大消息数
-	PullTimeout    time.Duration // 拉取超时时间
+	PullInterval   time.Duration // 拉取间隔
 }
 
 // Consumer 消息消费者
@@ -29,10 +28,10 @@ type Consumer struct {
 	config     *ConsumerConfig
 	client     *network.Client
 	subscribed bool
-	messages   chan *protocol.Message
 	stopCh     chan struct{}
 	wg         sync.WaitGroup
 	mu         sync.RWMutex
+	handler    func([]*protocol.Message)
 }
 
 // NewConsumer 创建一个新的消费者
@@ -53,8 +52,8 @@ func NewConsumer(config *ConsumerConfig) (*Consumer, error) {
 		config.MaxPullRecords = 100
 	}
 
-	if config.PullTimeout <= 0 {
-		config.PullTimeout = 5 * time.Second
+	if config.PullInterval <= 0 {
+		config.PullInterval = time.Second
 	}
 
 	// 创建到 broker 的连接
@@ -64,15 +63,14 @@ func NewConsumer(config *ConsumerConfig) (*Consumer, error) {
 	}
 
 	return &Consumer{
-		config:   config,
-		client:   client,
-		messages: make(chan *protocol.Message, 1000),
-		stopCh:   make(chan struct{}),
+		config: config,
+		client: client,
+		stopCh: make(chan struct{}),
 	}, nil
 }
 
-// Subscribe 订阅主题
-func (c *Consumer) Subscribe() error {
+// Subscribe 订阅主题并开始消费
+func (c *Consumer) Subscribe(handler func([]*protocol.Message)) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -81,14 +79,9 @@ func (c *Consumer) Subscribe() error {
 	}
 
 	// 创建订阅请求
-	req := &protocol.Message{
-		Message: &pb.Message{
-			Type: pb.MessageType_NORMAL,
-			Attributes: map[string]*anypb.Any{
-				"group_id": mustPackAny(c.config.GroupID),
-				"topics":   mustPackAny(strings.Join(c.config.Topics, ",")),
-			},
-		},
+	req := &pb.SubscribeRequest{
+		GroupId: c.config.GroupID,
+		Topics:  c.config.Topics,
 	}
 
 	// 发送订阅请求
@@ -102,95 +95,98 @@ func (c *Consumer) Subscribe() error {
 	}
 
 	c.subscribed = true
+	c.handler = handler
 
-	// 启动消息接收循环，接收服务器推送的消息
+	// 启动消息拉取循环
 	c.wg.Add(1)
-	go c.receiveMessages()
-
-	// 如果启用了自动提交，启动自动提交循环
-	if c.config.AutoCommit && c.config.CommitInterval > 0 {
-		c.wg.Add(1)
-		go c.autoCommitLoop()
-	}
+	go c.pullLoop()
 
 	return nil
 }
 
-// receiveMessages 接收消息
-func (c *Consumer) receiveMessages() {
+// pullLoop 消息拉取循环
+func (c *Consumer) pullLoop() {
 	defer c.wg.Done()
+
+	ticker := time.NewTicker(c.config.PullInterval)
+	defer ticker.Stop()
 
 	for {
 		select {
 		case <-c.stopCh:
 			return
-		default:
-			// 从客户端连接接收消息
-			msg, err := c.client.Receive()
-			if err != nil {
-				log.Printf("接收消息失败: %v", err)
-				time.Sleep(time.Second) // 出错后等待一段时间再重试
-				continue
-			}
+		case <-ticker.C:
+			for _, topic := range c.config.Topics {
+				messages, err := c.pull(topic)
+				if err != nil {
+					log.Printf("拉取消息失败: %v", err)
+					continue
+				}
 
-			// 检查消息类型，确保是普通消息而不是控制消息
-			if msg.Message.Type != pb.MessageType_NORMAL {
-				continue
-			}
+				if len(messages) > 0 {
+					// 处理消息
+					c.handler(messages)
 
-			// 发送到消息通道
-			select {
-			case c.messages <- msg:
-				// 消息成功发送到通道
-			default:
-				// 通道已满，记录日志
-				log.Printf("消息通道已满，丢弃消息: %s", msg.Message.Id)
+					// 如果启用了自动提交，提交消息确认
+					if c.config.AutoCommit {
+						lastMsg := messages[len(messages)-1]
+						if err := c.Commit(topic, []string{lastMsg.Message.Id}); err != nil {
+							log.Printf("自动提交失败: %v", err)
+						}
+					}
+				}
 			}
 		}
 	}
 }
 
-// Pull 拉取消息
-func (c *Consumer) Pull(timeout time.Duration) []*protocol.Message {
-	if !c.subscribed {
-		if err := c.Subscribe(); err != nil {
-			log.Printf("自动订阅失败: %v", err)
-			return nil
+// pull 从指定主题拉取消息
+func (c *Consumer) pull(topic string) ([]*protocol.Message, error) {
+	// 创建拉取请求
+	req := &pb.PullRequest{
+		GroupId:     c.config.GroupID,
+		Topic:       topic,
+		MaxMessages: int32(c.config.MaxPullRecords),
+	}
+
+	// 发送拉取请求
+	resp, err := c.client.Send("pull", req)
+	if err != nil {
+		return nil, fmt.Errorf("发送拉取请求失败: %w", err)
+	}
+
+	if resp.Status == pb.Status_ERROR {
+		return nil, fmt.Errorf("拉取消息失败: %s", resp.Message)
+	}
+
+	// 解析响应数据
+	if resp.GetResponseData() == nil {
+		return nil, fmt.Errorf("响应数据为空")
+	}
+
+	batchResp := resp.GetBatchMessagesData()
+	if batchResp == nil {
+		return nil, fmt.Errorf("响应数据类型错误")
+	}
+
+	// 转换消息格式
+	messages := make([]*protocol.Message, len(batchResp.Messages))
+	for i, msg := range batchResp.Messages {
+		messages[i] = &protocol.Message{
+			Message: msg,
 		}
 	}
 
-	var messages []*protocol.Message
-	timeoutCh := time.After(timeout)
-
-	// 收集消息直到超时或达到最大消息数
-	for {
-		select {
-		case msg := <-c.messages:
-			messages = append(messages, msg)
-			if len(messages) >= c.config.MaxPullRecords {
-				return messages
-			}
-		case <-timeoutCh:
-			return messages
-		}
-	}
+	return messages, nil
 }
 
 // Commit 提交消息确认
-func (c *Consumer) Commit(messageIDs []string) error {
-	if len(messageIDs) == 0 {
-		return nil
-	}
-
+func (c *Consumer) Commit(topic string, messageIDs []string) error {
 	// 创建确认请求
-	req := &protocol.Message{
-		Message: &pb.Message{
-			Type: pb.MessageType_NORMAL,
-			Attributes: map[string]*anypb.Any{
-				"group_id":    mustPackAny(c.config.GroupID),
-				"message_ids": mustPackAny(strings.Join(messageIDs, ",")),
-			},
-		},
+	req := &pb.AckRequest{
+		GroupId:    c.config.GroupID,
+		Topic:      topic,
+		MessageIds: messageIDs,
 	}
 
 	// 发送确认请求
@@ -221,9 +217,6 @@ func (c *Consumer) Close() error {
 	// 等待所有协程退出
 	c.wg.Wait()
 
-	// 关闭消息通道
-	close(c.messages)
-
 	// 关闭客户端连接
 	if err := c.client.Close(); err != nil {
 		return fmt.Errorf("关闭客户端连接失败: %w", err)
@@ -231,45 +224,6 @@ func (c *Consumer) Close() error {
 
 	c.subscribed = false
 	return nil
-}
-
-// autoCommitLoop 自动提交确认的循环
-func (c *Consumer) autoCommitLoop() {
-	defer c.wg.Done()
-
-	ticker := time.NewTicker(c.config.CommitInterval)
-	defer ticker.Stop()
-
-	var pendingMessages []string
-
-	for {
-		select {
-		case <-c.stopCh:
-			// 在退出前提交所有待确认的消息
-			if len(pendingMessages) > 0 {
-				if err := c.Commit(pendingMessages); err != nil {
-					log.Printf("自动提交失败: %v", err)
-				}
-			}
-			return
-		case <-ticker.C:
-			// 定时提交
-			if len(pendingMessages) > 0 {
-				if err := c.Commit(pendingMessages); err != nil {
-					log.Printf("自动提交失败: %v", err)
-				} else {
-					// 提交成功后清空待确认列表
-					pendingMessages = nil
-				}
-			}
-		case msg := <-c.messages:
-			// 记录消息ID，等待自动提交
-			pendingMessages = append(pendingMessages, msg.Message.Id)
-
-			// 将消息放回通道，供 Pull 方法获取
-			c.messages <- msg
-		}
-	}
 }
 
 // mustPackAny 将值打包为 Any 类型

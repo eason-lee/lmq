@@ -1,8 +1,12 @@
 package coordinator
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
+	"log"
+	"path"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -36,33 +40,30 @@ func NewConsulCoordinator(address string) (*ConsulCoordinator, error) {
 	}, nil
 }
 
-// RegisterService 注册服务到 Consul
-func (c *ConsulCoordinator) RegisterService(service *ServiceInfo) error {
+// RegisterService 注册服务
+func (c *ConsulCoordinator) RegisterService(ctx context.Context, serviceName string, addr string) error {
+	// 构建服务注册信息
 	reg := &api.AgentServiceRegistration{
-		ID:      service.ID,
-		Name:    service.Name,
-		Address: service.Address,
-		Port:    service.Port,
-		Tags:    service.Tags,
-		Meta:    service.Meta,
+		ID:      serviceName,
+		Name:    serviceName,
+		Address: addr,
 		Check: &api.AgentServiceCheck{
-			TCP:                            fmt.Sprintf("%s:%d", service.Address, service.Port),
-			Interval:                       "10s",
-			Timeout:                        "5s",
-			DeregisterCriticalServiceAfter: "30s",
+			TCP:      addr,
+			Interval: "10s",
+			Timeout:  "5s",
 		},
 	}
 
 	return c.client.Agent().ServiceRegister(reg)
 }
 
-// DeregisterService 从 Consul 注销服务
-func (c *ConsulCoordinator) DeregisterService(serviceID string) error {
-	return c.client.Agent().ServiceDeregister(serviceID)
+// UnregisterService 从 Consul 注销服务
+func (c *ConsulCoordinator) UnregisterService(ctx context.Context, serviceName string, addr string) error {
+	return c.client.Agent().ServiceDeregister(serviceName)
 }
 
 // DiscoverService 发现服务
-func (c *ConsulCoordinator) DiscoverService(serviceName string) ([]*ServiceInfo, error) {
+func (c *ConsulCoordinator) DiscoverService(ctx context.Context, serviceName string) ([]*ServiceInfo, error) {
 	services, _, err := c.client.Health().Service(serviceName, "", true, nil)
 	if err != nil {
 		return nil, fmt.Errorf("failed to discover service: %w", err)
@@ -83,14 +84,30 @@ func (c *ConsulCoordinator) DiscoverService(serviceName string) ([]*ServiceInfo,
 	return result, nil
 }
 
+// GetService 获取服务地址列表
+func (c *ConsulCoordinator) GetService(ctx context.Context, serviceName string) ([]string, error) {
+	services, _, err := c.client.Health().Service(serviceName, "", true, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get service: %w", err)
+	}
+
+	var addresses []string
+	for _, service := range services {
+		addr := fmt.Sprintf("%s:%d", service.Service.Address, service.Service.Port)
+		addresses = append(addresses, addr)
+	}
+
+	return addresses, nil
+}
+
 // ElectLeader 尝试成为领导者
-func (c *ConsulCoordinator) ElectLeader(serviceName string) (bool, error) {
+func (c *ConsulCoordinator) ElectLeader(ctx context.Context, key string) (bool, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
 	// 创建会话
 	session, _, err := c.client.Session().Create(&api.SessionEntry{
-		Name:     fmt.Sprintf("lmq-leader-%s", serviceName),
+		Name:     fmt.Sprintf("lmq-leader-%s", key),
 		TTL:      "15s",
 		Behavior: "release",
 	}, nil)
@@ -99,9 +116,9 @@ func (c *ConsulCoordinator) ElectLeader(serviceName string) (bool, error) {
 		return false, fmt.Errorf("failed to create session: %w", err)
 	}
 
-	key := fmt.Sprintf("lmq/leader/%s", serviceName)
+	lockKey := fmt.Sprintf("lmq/leader/%s", key)
 	acquired, _, err := c.client.KV().Acquire(&api.KVPair{
-		Key:     key,
+		Key:     lockKey,
 		Value:   []byte(session),
 		Session: session,
 	}, nil)
@@ -111,64 +128,87 @@ func (c *ConsulCoordinator) ElectLeader(serviceName string) (bool, error) {
 	}
 
 	if acquired {
-		c.sessions[key] = session
-		c.isLeader[serviceName] = true
+		c.sessions[lockKey] = session
+		c.isLeader[key] = true
 	}
 
 	return acquired, nil
 }
 
 // ResignLeader 放弃领导者身份
-func (c *ConsulCoordinator) ResignLeader(serviceName string) error {
+func (c *ConsulCoordinator) ResignLeader(ctx context.Context, key string) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	key := fmt.Sprintf("lmq/leader/%s", serviceName)
-	session, exists := c.sessions[key]
+	lockKey := fmt.Sprintf("lmq/leader/%s", key)
+	session, exists := c.sessions[lockKey]
 	if !exists {
 		return nil
 	}
 
 	released, _, err := c.client.KV().Release(&api.KVPair{
-		Key:     key,
+		Key:     lockKey,
 		Session: session,
 	}, nil)
 
-	if err == nil && released{
-		delete(c.sessions, key)
-		delete(c.isLeader, serviceName)
+	if err == nil && released {
+		delete(c.sessions, lockKey)
+		delete(c.isLeader, key)
 	}
 
 	return err
 }
 
 // IsLeader 检查是否是领导者
-func (c *ConsulCoordinator) IsLeader(serviceName string) bool {
+func (c *ConsulCoordinator) IsLeader(ctx context.Context, key string) (bool, error) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	return c.isLeader[serviceName]
+
+	return c.isLeader[key], nil
+}
+
+// GetLeader 获取当前的领导者
+func (c *ConsulCoordinator) GetLeader(ctx context.Context, key string) (string, error) {
+	lockKey := fmt.Sprintf("lmq/leader/%s", key)
+	pair, _, err := c.client.KV().Get(lockKey, nil)
+	if err != nil {
+		return "", err
+	}
+
+	if pair == nil {
+		return "", fmt.Errorf("no leader found for %s", key)
+	}
+
+	return string(pair.Value), nil
 }
 
 // WatchLeader 监听领导者变化
-func (c *ConsulCoordinator) WatchLeader(serviceName string) (<-chan string, error) {
+func (c *ConsulCoordinator) WatchLeader(ctx context.Context, key string) (<-chan string, error) {
 	ch := make(chan string, 1)
-	key := fmt.Sprintf("lmq/leader/%s", serviceName)
+	lockKey := fmt.Sprintf("lmq/leader/%s", key)
 
 	go func() {
+		defer close(ch)
+
 		var lastIndex uint64
 		for {
-			pair, meta, err := c.client.KV().Get(key, &api.QueryOptions{
-				WaitIndex: lastIndex,
-			})
-			if err != nil {
-				time.Sleep(time.Second)
-				continue
-			}
+			select {
+			case <-ctx.Done():
+				return
+			default:
+				pair, meta, err := c.client.KV().Get(lockKey, &api.QueryOptions{
+					WaitIndex: lastIndex,
+				})
+				if err != nil {
+					time.Sleep(time.Second)
+					continue
+				}
 
-			if meta.LastIndex > lastIndex {
-				lastIndex = meta.LastIndex
-				if pair != nil {
-					ch <- string(pair.Value)
+				if meta.LastIndex > lastIndex {
+					lastIndex = meta.LastIndex
+					if pair != nil {
+						ch <- string(pair.Value)
+					}
 				}
 			}
 		}
@@ -178,7 +218,7 @@ func (c *ConsulCoordinator) WatchLeader(serviceName string) (<-chan string, erro
 }
 
 // PutConfig 存储配置
-func (c *ConsulCoordinator) PutConfig(key string, value []byte) error {
+func (c *ConsulCoordinator) PutConfig(ctx context.Context, key string, value []byte) error {
 	_, err := c.client.KV().Put(&api.KVPair{
 		Key:   fmt.Sprintf("lmq/config/%s", key),
 		Value: value,
@@ -187,7 +227,7 @@ func (c *ConsulCoordinator) PutConfig(key string, value []byte) error {
 }
 
 // GetConfig 获取配置
-func (c *ConsulCoordinator) GetConfig(key string) ([]byte, error) {
+func (c *ConsulCoordinator) GetConfig(ctx context.Context, key string) ([]byte, error) {
 	pair, _, err := c.client.KV().Get(fmt.Sprintf("lmq/config/%s", key), nil)
 	if err != nil {
 		return nil, err
@@ -199,24 +239,32 @@ func (c *ConsulCoordinator) GetConfig(key string) ([]byte, error) {
 }
 
 // WatchConfig 监听配置变化
-func (c *ConsulCoordinator) WatchConfig(key string) (<-chan []byte, error) {
+func (c *ConsulCoordinator) WatchConfig(ctx context.Context, key string) (<-chan []byte, error) {
 	ch := make(chan []byte, 1)
+	configKey := fmt.Sprintf("lmq/config/%s", key)
 
 	go func() {
+		defer close(ch)
+
 		var lastIndex uint64
 		for {
-			pair, meta, err := c.client.KV().Get(fmt.Sprintf("lmq/config/%s", key), &api.QueryOptions{
-				WaitIndex: lastIndex,
-			})
-			if err != nil {
-				time.Sleep(time.Second)
-				continue
-			}
+			select {
+			case <-ctx.Done():
+				return
+			default:
+				pair, meta, err := c.client.KV().Get(configKey, &api.QueryOptions{
+					WaitIndex: lastIndex,
+				})
+				if err != nil {
+					time.Sleep(time.Second)
+					continue
+				}
 
-			if meta.LastIndex > lastIndex {
-				lastIndex = meta.LastIndex
-				if pair != nil {
-					ch <- pair.Value
+				if meta.LastIndex > lastIndex {
+					lastIndex = meta.LastIndex
+					if pair != nil {
+						ch <- pair.Value
+					}
 				}
 			}
 		}
@@ -267,7 +315,7 @@ func (c *ConsulCoordinator) ReleaseLock(key string) error {
 		Session: session,
 	}, nil)
 
-	if err == nil && released{
+	if err == nil && released {
 		c.mu.Lock()
 		delete(c.sessions, key)
 		c.mu.Unlock()
@@ -293,16 +341,6 @@ func (c *ConsulCoordinator) Close() error {
 	return nil
 }
 
-
-// PartitionInfo 分区信息
-type PartitionInfo struct {
-	Topic     string   `json:"topic"`
-	ID        int      `json:"id"`
-	Leader    string   `json:"leader"`
-	Followers []string `json:"followers"`
-	ISR       []string `json:"isr"`
-}
-
 // CreatePartition 创建分区
 func (c *ConsulCoordinator) CreatePartition(partition *PartitionInfo) error {
 	data, err := json.Marshal(partition)
@@ -320,15 +358,15 @@ func (c *ConsulCoordinator) CreatePartition(partition *PartitionInfo) error {
 }
 
 // GetPartition 获取分区信息
-func (c *ConsulCoordinator) GetPartition(topic string, partitionID int) (*PartitionInfo, error) {
-	key := fmt.Sprintf("lmq/partitions/%s/%d", topic, partitionID)
+func (c *ConsulCoordinator) GetPartition(ctx context.Context, topic string) (*PartitionInfo, error) {
+	key := fmt.Sprintf("topics/%s/partitions/0", topic)
 	pair, _, err := c.client.KV().Get(key, nil)
 	if err != nil {
 		return nil, fmt.Errorf("获取分区信息失败: %w", err)
 	}
 
 	if pair == nil {
-		return nil, nil // 分区不存在
+		return nil, fmt.Errorf("分区不存在")
 	}
 
 	var partition PartitionInfo
@@ -339,15 +377,15 @@ func (c *ConsulCoordinator) GetPartition(topic string, partitionID int) (*Partit
 	return &partition, nil
 }
 
-// GetAllPartitions 获取主题的所有分区
-func (c *ConsulCoordinator) GetAllPartitions(topic string) ([]*PartitionInfo, error) {
-	prefix := fmt.Sprintf("lmq/partitions/%s/", topic)
+// GetPartitions 获取主题的所有分区
+func (c *ConsulCoordinator) GetPartitions(ctx context.Context, topic string) ([]*PartitionInfo, error) {
+	prefix := fmt.Sprintf("topics/%s/partitions/", topic)
 	pairs, _, err := c.client.KV().List(prefix, nil)
 	if err != nil {
 		return nil, fmt.Errorf("获取分区列表失败: %w", err)
 	}
 
-	var partitions []*PartitionInfo
+	partitions := make([]*PartitionInfo, 0, len(pairs))
 	for _, pair := range pairs {
 		var partition PartitionInfo
 		if err := json.Unmarshal(pair.Value, &partition); err != nil {
@@ -359,53 +397,99 @@ func (c *ConsulCoordinator) GetAllPartitions(topic string) ([]*PartitionInfo, er
 	return partitions, nil
 }
 
+// GetPartitionLeader 获取分区的leader节点
+func (c *ConsulCoordinator) GetPartitionLeader(ctx context.Context, topic string, partitionID int) (string, error) {
+	partition, err := c.GetPartition(ctx, topic)
+	if err != nil {
+		return "", err
+	}
+
+	if partition == nil {
+		return "", fmt.Errorf("分区不存在: %s-%d", topic, partitionID)
+	}
+
+	return partition.Leader, nil
+}
+
+// GetPartitionReplicas 获取分区的副本列表
+func (c *ConsulCoordinator) GetPartitionReplicas(ctx context.Context, topic string, partitionID int) ([]string, error) {
+	key := fmt.Sprintf("topics/%s/partitions/%d", topic, partitionID)
+	pair, _, err := c.client.KV().Get(key, nil)
+	if err != nil {
+		return nil, fmt.Errorf("获取分区信息失败: %w", err)
+	}
+
+	if pair == nil {
+		return nil, fmt.Errorf("分区不存在")
+	}
+
+	var partition PartitionInfo
+	if err := json.Unmarshal(pair.Value, &partition); err != nil {
+		return nil, fmt.Errorf("解析分区信息失败: %w", err)
+	}
+
+	return partition.Replicas, nil
+}
+
 // UpdatePartition 更新分区信息
 func (c *ConsulCoordinator) UpdatePartition(partition *PartitionInfo) error {
-	data, err := json.Marshal(partition)
+	key := fmt.Sprintf("topics/%s/partitions/%d", partition.Topic, partition.ID)
+	value, err := json.Marshal(partition)
 	if err != nil {
 		return fmt.Errorf("序列化分区信息失败: %w", err)
 	}
 
-	key := fmt.Sprintf("lmq/partitions/%s/%d", partition.Topic, partition.ID)
-	_, err = c.client.KV().Put(&api.KVPair{
+	p := &api.KVPair{
 		Key:   key,
-		Value: data,
-	}, nil)
+		Value: value,
+	}
 
-	return err
+	_, err = c.client.KV().Put(p, nil)
+	if err != nil {
+		return fmt.Errorf("更新分区信息失败: %w", err)
+	}
+
+	return nil
 }
 
 // DeletePartition 删除分区
-func (c *ConsulCoordinator) DeletePartition(topic string, partitionID int) error {
+func (c *ConsulCoordinator) DeletePartition(ctx context.Context, topic string, partitionID int) error {
 	key := fmt.Sprintf("lmq/partitions/%s/%d", topic, partitionID)
 	_, err := c.client.KV().Delete(key, nil)
 	return err
 }
 
 // WatchPartition 监听分区变化
-func (c *ConsulCoordinator) WatchPartition(topic string, partitionID int) (<-chan *PartitionInfo, error) {
+func (c *ConsulCoordinator) WatchPartition(ctx context.Context, topic string, partitionID int) (<-chan *PartitionInfo, error) {
 	ch := make(chan *PartitionInfo, 1)
 	key := fmt.Sprintf("lmq/partitions/%s/%d", topic, partitionID)
 
 	go func() {
+		defer close(ch)
+
 		var lastIndex uint64
 		for {
-			pair, meta, err := c.client.KV().Get(key, &api.QueryOptions{
-				WaitIndex: lastIndex,
-			})
-			if err != nil {
-				time.Sleep(time.Second)
-				continue
-			}
+			select {
+			case <-ctx.Done():
+				return
+			default:
+				pair, meta, err := c.client.KV().Get(key, &api.QueryOptions{
+					WaitIndex: lastIndex,
+				})
+				if err != nil {
+					time.Sleep(time.Second)
+					continue
+				}
 
-			if meta.LastIndex > lastIndex {
-				lastIndex = meta.LastIndex
-				if pair != nil {
-					var partition PartitionInfo
-					if err := json.Unmarshal(pair.Value, &partition); err != nil {
-						continue
+				if meta.LastIndex > lastIndex {
+					lastIndex = meta.LastIndex
+					if pair != nil {
+						var partition PartitionInfo
+						if err := json.Unmarshal(pair.Value, &partition); err != nil {
+							continue
+						}
+						ch <- &partition
 					}
-					ch <- &partition
 				}
 			}
 		}
@@ -415,44 +499,44 @@ func (c *ConsulCoordinator) WatchPartition(topic string, partitionID int) (<-cha
 }
 
 // CreateTopic 创建主题
-func (c *ConsulCoordinator) CreateTopic(topic string, partitionCount int) error {
+func (c *ConsulCoordinator) CreateTopic(ctx context.Context, topic string, partitionCount int) error {
 	// 检查主题是否已存在
-	key := fmt.Sprintf("lmq/topics/%s", topic)
-	pair, _, err := c.client.KV().Get(key, nil)
+	exists, err := c.TopicExists(ctx, topic)
 	if err != nil {
-		return fmt.Errorf("检查主题失败: %w", err)
+		return err
+	}
+	if exists {
+		return fmt.Errorf("主题已存在: %s", topic)
 	}
 
-	if pair != nil {
-		return fmt.Errorf("主题 %s 已存在", topic)
+	// 创建主题配置
+	topicConfig := map[string]interface{}{
+		"partitions": partitionCount,
+		"created_at": time.Now().Unix(),
 	}
 
-	// 创建主题元数据
-	topicInfo := map[string]interface{}{
-		"name":            topic,
-		"partition_count": partitionCount,
-		"created_at":      time.Now().Unix(),
-	}
-
-	data, err := json.Marshal(topicInfo)
+	// 将配置写入Consul
+	data, err := json.Marshal(topicConfig)
 	if err != nil {
-		return fmt.Errorf("序列化主题信息失败: %w", err)
+		return fmt.Errorf("序列化主题配置失败: %w", err)
 	}
 
-	_, err = c.client.KV().Put(&api.KVPair{
+	key := path.Join("topics", topic)
+	p := &api.KVPair{
 		Key:   key,
 		Value: data,
-	}, nil)
+	}
 
+	_, err = c.client.KV().Put(p, nil)
 	if err != nil {
-		return fmt.Errorf("创建主题失败: %w", err)
+		return fmt.Errorf("写入主题配置失败: %w", err)
 	}
 
 	return nil
 }
 
 // GetTopic 获取主题信息
-func (c *ConsulCoordinator) GetTopic(topic string) (map[string]interface{}, error) {
+func (c *ConsulCoordinator) GetTopic(ctx context.Context, topic string) (map[string]interface{}, error) {
 	key := fmt.Sprintf("lmq/topics/%s", topic)
 	pair, _, err := c.client.KV().Get(key, nil)
 	if err != nil {
@@ -471,8 +555,8 @@ func (c *ConsulCoordinator) GetTopic(topic string) (map[string]interface{}, erro
 	return topicInfo, nil
 }
 
-// GetAllTopics 获取所有主题
-func (c *ConsulCoordinator) GetAllTopics() ([]string, error) {
+// GetTopics 获取所有主题
+func (c *ConsulCoordinator) GetTopics(ctx context.Context) ([]string, error) {
 	prefix := "lmq/topics/"
 	pairs, _, err := c.client.KV().List(prefix, nil)
 	if err != nil {
@@ -490,28 +574,30 @@ func (c *ConsulCoordinator) GetAllTopics() ([]string, error) {
 }
 
 // DeleteTopic 删除主题
-func (c *ConsulCoordinator) DeleteTopic(topic string) error {
-	// 删除主题元数据
-	key := fmt.Sprintf("lmq/topics/%s", topic)
-	_, err := c.client.KV().Delete(key, nil)
+func (c *ConsulCoordinator) DeleteTopic(ctx context.Context, topic string) error {
+	// 检查主题是否存在
+	exists, err := c.TopicExists(ctx, topic)
 	if err != nil {
-		return fmt.Errorf("删除主题元数据失败: %w", err)
+		return err
+	}
+	if !exists {
+		return fmt.Errorf("主题不存在: %s", topic)
 	}
 
-	// 删除主题的所有分区
-	prefix := fmt.Sprintf("lmq/partitions/%s/", topic)
-	_, err = c.client.KV().DeleteTree(prefix, nil)
+	// 删除主题配置
+	key := path.Join("topics", topic)
+	_, err = c.client.KV().Delete(key, nil)
 	if err != nil {
-		return fmt.Errorf("删除主题分区失败: %w", err)
+		return fmt.Errorf("删除主题配置失败: %w", err)
 	}
 
 	return nil
 }
 
 // ElectPartitionLeader 为分区选举leader
-func (c *ConsulCoordinator) ElectPartitionLeader(topic string, partitionID int, nodeID string) (bool, error) {
+func (c *ConsulCoordinator) ElectPartitionLeader(ctx context.Context, topic string, partitionID int, nodeID string) (bool, error) {
 	// 获取分区信息
-	partition, err := c.GetPartition(topic, partitionID)
+	partition, err := c.GetPartition(ctx, topic)
 	if err != nil {
 		return false, err
 	}
@@ -546,7 +632,7 @@ func (c *ConsulCoordinator) ElectPartitionLeader(topic string, partitionID int, 
 	if acquired {
 		// 更新分区元数据
 		partition.Leader = nodeID
-		
+
 		// 如果节点在followers中，将其移除
 		var newFollowers []string
 		for _, f := range partition.Followers {
@@ -555,7 +641,7 @@ func (c *ConsulCoordinator) ElectPartitionLeader(topic string, partitionID int, 
 			}
 		}
 		partition.Followers = newFollowers
-		
+
 		// 确保节点在ISR中
 		inISR := false
 		for _, isr := range partition.ISR {
@@ -567,7 +653,7 @@ func (c *ConsulCoordinator) ElectPartitionLeader(topic string, partitionID int, 
 		if !inISR {
 			partition.ISR = append(partition.ISR, nodeID)
 		}
-		
+
 		// 更新分区信息
 		if err := c.UpdatePartition(partition); err != nil {
 			// 如果更新失败，释放锁
@@ -577,7 +663,7 @@ func (c *ConsulCoordinator) ElectPartitionLeader(topic string, partitionID int, 
 			}, nil)
 			return false, fmt.Errorf("更新分区信息失败: %w", err)
 		}
-		
+
 		// 保存会话ID
 		c.mu.Lock()
 		c.sessions[key] = session
@@ -588,13 +674,13 @@ func (c *ConsulCoordinator) ElectPartitionLeader(topic string, partitionID int, 
 }
 
 // ResignPartitionLeader 放弃分区leader身份
-func (c *ConsulCoordinator) ResignPartitionLeader(topic string, partitionID int) error {
+func (c *ConsulCoordinator) ResignPartitionLeader(ctx context.Context, topic string, partitionID int) error {
 	key := fmt.Sprintf("lmq/partition-leaders/%s/%d", topic, partitionID)
-	
+
 	c.mu.Lock()
 	session, exists := c.sessions[key]
 	c.mu.Unlock()
-	
+
 	if !exists {
 		return nil
 	}
@@ -614,7 +700,7 @@ func (c *ConsulCoordinator) ResignPartitionLeader(topic string, partitionID int)
 }
 
 // IsPartitionLeader 检查节点是否是分区的leader
-func (c *ConsulCoordinator) IsPartitionLeader(topic string, partitionID int, nodeID string) (bool, error) {
+func (c *ConsulCoordinator) IsPartitionLeader(ctx context.Context, topic string, partitionID int, nodeID string) (bool, error) {
 	key := fmt.Sprintf("lmq/partition-leaders/%s/%d", topic, partitionID)
 	pair, _, err := c.client.KV().Get(key, nil)
 	if err != nil {
@@ -629,26 +715,17 @@ func (c *ConsulCoordinator) IsPartitionLeader(topic string, partitionID int, nod
 }
 
 // RegisterReplicaStatus 注册副本状态
-func (c *ConsulCoordinator) RegisterReplicaStatus(topic string, partitionID int, nodeID string, offset int64) error {
+func (c *ConsulCoordinator) RegisterReplicaStatus(ctx context.Context, topic string, partitionID int, nodeID string, offset int64) error {
 	key := fmt.Sprintf("lmq/replica-status/%s/%d/%s", topic, partitionID, nodeID)
-	data, err := json.Marshal(map[string]interface{}{
-		"offset":     offset,
-		"updated_at": time.Now().Unix(),
-	})
-	if err != nil {
-		return err
-	}
-
-	_, err = c.client.KV().Put(&api.KVPair{
+	_, err := c.client.KV().Put(&api.KVPair{
 		Key:   key,
-		Value: data,
+		Value: []byte(fmt.Sprintf("%d", offset)),
 	}, nil)
-
 	return err
 }
 
 // GetReplicaStatus 获取副本状态
-func (c *ConsulCoordinator) GetReplicaStatus(topic string, partitionID int, nodeID string) (int64, error) {
+func (c *ConsulCoordinator) GetReplicaStatus(ctx context.Context, topic string, partitionID int, nodeID string) (int64, error) {
 	key := fmt.Sprintf("lmq/replica-status/%s/%d/%s", topic, partitionID, nodeID)
 	pair, _, err := c.client.KV().Get(key, nil)
 	if err != nil {
@@ -656,24 +733,14 @@ func (c *ConsulCoordinator) GetReplicaStatus(topic string, partitionID int, node
 	}
 
 	if pair == nil {
-		return 0, nil // 副本状态不存在
+		return 0, nil
 	}
 
-	var status map[string]interface{}
-	if err := json.Unmarshal(pair.Value, &status); err != nil {
-		return 0, err
-	}
-
-	offset, ok := status["offset"].(float64)
-	if !ok {
-		return 0, fmt.Errorf("无效的偏移量格式")
-	}
-
-	return int64(offset), nil
+	return strconv.ParseInt(string(pair.Value), 10, 64)
 }
 
-// GetAllReplicaStatus 获取分区的所有副本状态
-func (c *ConsulCoordinator) GetAllReplicaStatus(topic string, partitionID int) (map[string]int64, error) {
+// GetAllReplicaStatus 获取所有副本状态
+func (c *ConsulCoordinator) GetAllReplicaStatus(ctx context.Context, topic string, partitionID int) (map[string]int64, error) {
 	prefix := fmt.Sprintf("lmq/replica-status/%s/%d/", topic, partitionID)
 	pairs, _, err := c.client.KV().List(prefix, nil)
 	if err != nil {
@@ -682,207 +749,67 @@ func (c *ConsulCoordinator) GetAllReplicaStatus(topic string, partitionID int) (
 
 	result := make(map[string]int64)
 	for _, pair := range pairs {
-		// 从键中提取节点ID
 		nodeID := strings.TrimPrefix(pair.Key, prefix)
-		
-		var status map[string]interface{}
-		if err := json.Unmarshal(pair.Value, &status); err != nil {
-			return nil, err
+		offset, err := strconv.ParseInt(string(pair.Value), 10, 64)
+		if err != nil {
+			continue
 		}
-
-		offset, ok := status["offset"].(float64)
-		if !ok {
-			return nil, fmt.Errorf("无效的偏移量格式")
-		}
-
-		result[nodeID] = int64(offset)
+		result[nodeID] = offset
 	}
 
 	return result, nil
 }
 
-// GetPartitionLeader 获取分区的leader节点ID
-func (c *ConsulCoordinator) GetPartitionLeader(topic string, partitionID int) (string, error) {
-	key := fmt.Sprintf("lmq/partition-leaders/%s/%d", topic, partitionID)
-	pair, _, err := c.client.KV().Get(key, nil)
-	if err != nil {
-		return "", err
-	}
-
-	if pair == nil {
-		return "", nil // 没有leader
-	}
-
-	return string(pair.Value), nil
-}
-
-// UpdateISR 更新分区的ISR列表
-func (c *ConsulCoordinator) UpdateISR(topic string, partitionID int, isr []string) error {
-	partition, err := c.GetPartition(topic, partitionID)
-	if err != nil {
-		return err
-	}
-
-	if partition == nil {
-		return fmt.Errorf("分区不存在: %s-%d", topic, partitionID)
-	}
-
-	partition.ISR = isr
-	return c.UpdatePartition(partition)
-}
-
-// AddToISR 将节点添加到ISR
-func (c *ConsulCoordinator) AddToISR(topic string, partitionID int, nodeID string) error {
-	partition, err := c.GetPartition(topic, partitionID)
-	if err != nil {
-		return err
-	}
-
-	if partition == nil {
-		return fmt.Errorf("分区不存在: %s-%d", topic, partitionID)
-	}
-
-	// 检查节点是否已在ISR中
-	for _, id := range partition.ISR {
-		if id == nodeID {
-			return nil // 已经在ISR中
-		}
-	}
-
-	// 添加到ISR
-	partition.ISR = append(partition.ISR, nodeID)
-	return c.UpdatePartition(partition)
-}
-
-// RemoveFromISR 从ISR中移除节点
-func (c *ConsulCoordinator) RemoveFromISR(topic string, partitionID int, nodeID string) error {
-	partition, err := c.GetPartition(topic, partitionID)
-	if err != nil {
-		return err
-	}
-
-	if partition == nil {
-		return fmt.Errorf("分区不存在: %s-%d", topic, partitionID)
-	}
-
-	// 从ISR中移除节点
-	var newISR []string
-	for _, id := range partition.ISR {
-		if id != nodeID {
-			newISR = append(newISR, id)
-		}
-	}
-
-	// 如果ISR没有变化，直接返回
-	if len(newISR) == len(partition.ISR) {
-		return nil
-	}
-
-	partition.ISR = newISR
-	return c.UpdatePartition(partition)
-}
-
-// AddFollower 添加follower节点
-func (c *ConsulCoordinator) AddFollower(topic string, partitionID int, nodeID string) error {
-	partition, err := c.GetPartition(topic, partitionID)
-	if err != nil {
-		return err
-	}
-
-	if partition == nil {
-		return fmt.Errorf("分区不存在: %s-%d", topic, partitionID)
-	}
-
-	// 如果节点是leader，不能添加为follower
-	if partition.Leader == nodeID {
-		return fmt.Errorf("节点 %s 是分区 %s-%d 的leader，不能添加为follower", nodeID, topic, partitionID)
-	}
-
-	// 检查节点是否已是follower
-	for _, id := range partition.Followers {
-		if id == nodeID {
-			return nil // 已经是follower
-		}
-	}
-
-	// 添加为follower
-	partition.Followers = append(partition.Followers, nodeID)
-	return c.UpdatePartition(partition)
-}
-
-// RemoveFollower 移除follower节点
-func (c *ConsulCoordinator) RemoveFollower(topic string, partitionID int, nodeID string) error {
-	partition, err := c.GetPartition(topic, partitionID)
-	if err != nil {
-		return err
-	}
-
-	if partition == nil {
-		return fmt.Errorf("分区不存在: %s-%d", topic, partitionID)
-	}
-
-	// 从followers中移除节点
-	var newFollowers []string
-	for _, id := range partition.Followers {
-		if id != nodeID {
-			newFollowers = append(newFollowers, id)
-		}
-	}
-
-	// 如果followers没有变化，直接返回
-	if len(newFollowers) == len(partition.Followers) {
-		return nil
-	}
-
-	partition.Followers = newFollowers
-	return c.UpdatePartition(partition)
-}
-
-// GetTopicPartitionCount 获取主题的分区数量
-func (c *ConsulCoordinator) GetTopicPartitionCount(topic string) (int, error) {
-	topicInfo, err := c.GetTopic(topic)
+// GetTopicPartitionCount 获取主题的分区数
+func (c *ConsulCoordinator) GetTopicPartitionCount(ctx context.Context, topic string) (int, error) {
+	topicInfo, err := c.GetTopic(ctx, topic)
 	if err != nil {
 		return 0, err
 	}
 
 	if topicInfo == nil {
-		return 0, fmt.Errorf("主题 %s 不存在", topic)
+		return 0, fmt.Errorf("主题不存在: %s", topic)
 	}
 
-	partitionCount, ok := topicInfo["partition_count"].(float64)
+	partitions, ok := topicInfo["partitions"].(float64)
 	if !ok {
-		return 0, fmt.Errorf("无效的分区数量格式")
+		return 0, fmt.Errorf("主题分区数格式错误")
 	}
 
-	return int(partitionCount), nil
+	return int(partitions), nil
 }
 
 // WatchTopics 监听主题变化
-func (c *ConsulCoordinator) WatchTopics() (<-chan []string, error) {
+func (c *ConsulCoordinator) WatchTopics(ctx context.Context) (<-chan []string, error) {
 	ch := make(chan []string, 1)
 	prefix := "lmq/topics/"
 
 	go func() {
+		defer close(ch)
+
 		var lastIndex uint64
 		for {
-			pairs, meta, err := c.client.KV().List(prefix, &api.QueryOptions{
-				WaitIndex: lastIndex,
-			})
-			if err != nil {
-				time.Sleep(time.Second)
-				continue
-			}
-
-			if meta.LastIndex > lastIndex {
-				lastIndex = meta.LastIndex
-				
-				var topics []string
-				for _, pair := range pairs {
-					topic := strings.TrimPrefix(pair.Key, prefix)
-					topics = append(topics, topic)
+			select {
+			case <-ctx.Done():
+				return
+			default:
+				pairs, meta, err := c.client.KV().List(prefix, &api.QueryOptions{
+					WaitIndex: lastIndex,
+				})
+				if err != nil {
+					time.Sleep(time.Second)
+					continue
 				}
-				
-				ch <- topics
+
+				if meta.LastIndex > lastIndex {
+					lastIndex = meta.LastIndex
+					topics := make([]string, 0, len(pairs))
+					for _, pair := range pairs {
+						topic := strings.TrimPrefix(pair.Key, prefix)
+						topics = append(topics, topic)
+					}
+					ch <- topics
+				}
 			}
 		}
 	}()
@@ -890,99 +817,335 @@ func (c *ConsulCoordinator) WatchTopics() (<-chan []string, error) {
 	return ch, nil
 }
 
-// GetNodePartitions 获取节点负责的所有分区
-func (c *ConsulCoordinator) GetNodePartitions(nodeID string) ([]*PartitionInfo, error) {
+// GetNodePartitions 获取节点的所有分区
+func (c *ConsulCoordinator) GetNodePartitions(ctx context.Context, nodeID string) ([]*PartitionInfo, error) {
 	// 获取所有主题
-	topics, err := c.GetAllTopics()
+	topics, err := c.GetTopics(ctx)
 	if err != nil {
 		return nil, err
 	}
 
-	var result []*PartitionInfo
-	
-	// 遍历所有主题的所有分区
+	var partitions []*PartitionInfo
 	for _, topic := range topics {
-		partitions, err := c.GetAllPartitions(topic)
+		// 获取主题的所有分区
+		topicPartitions, err := c.GetPartitions(ctx, topic)
 		if err != nil {
-			return nil, err
+			continue
 		}
 
-		// 查找节点负责的分区
-		for _, partition := range partitions {
-			// 如果节点是leader
-			if partition.Leader == nodeID {
-				result = append(result, partition)
-				continue
-			}
-
-			// 如果节点是follower
-			for _, follower := range partition.Followers {
-				if follower == nodeID {
-					result = append(result, partition)
+		// 检查每个分区是否属于该节点
+		for _, partition := range topicPartitions {
+			for _, replica := range partition.Replicas {
+				if replica == nodeID {
+					partitions = append(partitions, partition)
 					break
 				}
 			}
 		}
 	}
 
-	return result, nil
+	return partitions, nil
 }
 
 // GetLeaderPartitions 获取节点作为leader的所有分区
-func (c *ConsulCoordinator) GetLeaderPartitions(nodeID string) ([]*PartitionInfo, error) {
+func (c *ConsulCoordinator) GetLeaderPartitions(ctx context.Context, nodeID string) ([]*PartitionInfo, error) {
 	// 获取所有主题
-	topics, err := c.GetAllTopics()
+	topics, err := c.GetTopics(ctx)
 	if err != nil {
 		return nil, err
 	}
 
-	var result []*PartitionInfo
-	
-	// 遍历所有主题的所有分区
+	var partitions []*PartitionInfo
 	for _, topic := range topics {
-		partitions, err := c.GetAllPartitions(topic)
+		// 获取主题的所有分区
+		topicPartitions, err := c.GetPartitions(ctx, topic)
 		if err != nil {
-			return nil, err
+			continue
 		}
 
-		// 查找节点作为leader的分区
-		for _, partition := range partitions {
+		// 检查每个分区的leader是否是该节点
+		for _, partition := range topicPartitions {
 			if partition.Leader == nodeID {
-				result = append(result, partition)
+				partitions = append(partitions, partition)
 			}
 		}
 	}
 
-	return result, nil
+	return partitions, nil
 }
 
 // GetFollowerPartitions 获取节点作为follower的所有分区
-func (c *ConsulCoordinator) GetFollowerPartitions(nodeID string) ([]*PartitionInfo, error) {
+func (c *ConsulCoordinator) GetFollowerPartitions(ctx context.Context, nodeID string) ([]*PartitionInfo, error) {
 	// 获取所有主题
-	topics, err := c.GetAllTopics()
+	topics, err := c.GetTopics(ctx)
 	if err != nil {
 		return nil, err
 	}
 
-	var result []*PartitionInfo
-	
-	// 遍历所有主题的所有分区
+	var partitions []*PartitionInfo
 	for _, topic := range topics {
-		partitions, err := c.GetAllPartitions(topic)
+		// 获取主题的所有分区
+		topicPartitions, err := c.GetPartitions(ctx, topic)
 		if err != nil {
-			return nil, err
+			continue
 		}
 
-		// 查找节点作为follower的分区
-		for _, partition := range partitions {
+		// 检查每个分区的follower是否包含该节点
+		for _, partition := range topicPartitions {
 			for _, follower := range partition.Followers {
 				if follower == nodeID {
-					result = append(result, partition)
+					partitions = append(partitions, partition)
 					break
 				}
 			}
 		}
 	}
 
-	return result, nil
+	return partitions, nil
+}
+
+// RegisterConsumer 注册消费者
+func (c *ConsulCoordinator) RegisterConsumer(ctx context.Context, groupID string, topics []string) error {
+	group := &ConsumerGroupInfo{
+		GroupID:    groupID,
+		Topics:     topics,
+		Offsets:    make(map[string]int64),
+		Partitions: make(map[string]int),
+	}
+
+	data, err := json.Marshal(group)
+	if err != nil {
+		return fmt.Errorf("序列化消费者组信息失败: %w", err)
+	}
+
+	key := fmt.Sprintf("lmq/consumer-groups/%s", groupID)
+	_, err = c.client.KV().Put(&api.KVPair{
+		Key:   key,
+		Value: data,
+	}, nil)
+
+	return err
+}
+
+// UnregisterConsumer 注销消费者
+func (c *ConsulCoordinator) UnregisterConsumer(ctx context.Context, groupID string) error {
+	key := fmt.Sprintf("lmq/consumer-groups/%s", groupID)
+	_, err := c.client.KV().Delete(key, nil)
+	return err
+}
+
+// GetConsumerGroup 获取消费者组信息
+func (c *ConsulCoordinator) GetConsumerGroup(ctx context.Context, groupID string) (*ConsumerGroupInfo, error) {
+	key := fmt.Sprintf("lmq/consumer-groups/%s", groupID)
+	pair, _, err := c.client.KV().Get(key, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	if pair == nil {
+		return nil, nil
+	}
+
+	var group ConsumerGroupInfo
+	if err := json.Unmarshal(pair.Value, &group); err != nil {
+		return nil, fmt.Errorf("解析消费者组信息失败: %w", err)
+	}
+
+	return &group, nil
+}
+
+// CommitOffset 提交消费位置
+func (c *ConsulCoordinator) CommitOffset(ctx context.Context, groupID string, topic string, offset int64) error {
+	group, err := c.GetConsumerGroup(ctx, groupID)
+	if err != nil {
+		return err
+	}
+
+	if group == nil {
+		return fmt.Errorf("消费者组不存在: %s", groupID)
+	}
+
+	group.Offsets[topic] = offset
+
+	data, err := json.Marshal(group)
+	if err != nil {
+		return fmt.Errorf("序列化消费者组信息失败: %w", err)
+	}
+
+	key := fmt.Sprintf("lmq/consumer-groups/%s", groupID)
+	_, err = c.client.KV().Put(&api.KVPair{
+		Key:   key,
+		Value: data,
+	}, nil)
+
+	return err
+}
+
+// GetConsumerOffset 获取消费位置
+func (c *ConsulCoordinator) GetConsumerOffset(ctx context.Context, groupID string, topic string) (int64, error) {
+	group, err := c.GetConsumerGroup(ctx, groupID)
+	if err != nil {
+		return 0, err
+	}
+
+	if group == nil {
+		return 0, fmt.Errorf("消费者组不存在: %s", groupID)
+	}
+
+	offset, ok := group.Offsets[topic]
+	if !ok {
+		return 0, nil
+	}
+
+	return offset, nil
+}
+
+// GetConsumerPartition 获取消费者分区
+func (c *ConsulCoordinator) GetConsumerPartition(ctx context.Context, groupID string, topic string) (int, error) {
+	group, err := c.GetConsumerGroup(ctx, groupID)
+	if err != nil {
+		return 0, err
+	}
+
+	if group == nil {
+		return 0, fmt.Errorf("消费者组不存在: %s", groupID)
+	}
+
+	partition, ok := group.Partitions[topic]
+	if !ok {
+		return 0, nil
+	}
+
+	return partition, nil
+}
+
+// hash 计算字符串的哈希值
+func hash(s string) uint32 {
+	var h uint32
+	for i := 0; i < len(s); i++ {
+		h = h*31 + uint32(s[i])
+	}
+	return h
+}
+
+// parseOffset 从消息ID中提取offset
+func parseOffset(messageID string) int64 {
+	parts := strings.Split(messageID, "-")
+	if len(parts) != 2 {
+		return 0
+	}
+
+	offset, err := strconv.ParseInt(parts[1], 10, 64)
+	if err != nil {
+		return 0
+	}
+
+	return offset
+}
+
+// AddToISR 添加节点到 ISR 列表
+func (c *ConsulCoordinator) AddToISR(ctx context.Context, topic string, partitionID int, nodeID string) error {
+	partition, err := c.GetPartition(ctx, topic)
+	if err != nil {
+		return err
+	}
+
+	// 检查节点是否已经在 ISR 中
+	for _, id := range partition.ISR {
+		if id == nodeID {
+			return nil
+		}
+	}
+
+	// 添加到 ISR
+	partition.ISR = append(partition.ISR, nodeID)
+
+	// 更新分区信息
+	return c.UpdatePartition(partition)
+}
+
+// RemoveFromISR 从 ISR 列表中移除节点
+func (c *ConsulCoordinator) RemoveFromISR(ctx context.Context, topic string, partitionID int, nodeID string) error {
+	partition, err := c.GetPartition(ctx, topic)
+	if err != nil {
+		return err
+	}
+
+	// 从 ISR 中移除节点
+	newISR := make([]string, 0, len(partition.ISR))
+	for _, id := range partition.ISR {
+		if id != nodeID {
+			newISR = append(newISR, id)
+		}
+	}
+	partition.ISR = newISR
+
+	// 更新分区信息
+	return c.UpdatePartition(partition)
+}
+
+// GetISR 获取 ISR 列表
+func (c *ConsulCoordinator) GetISR(ctx context.Context, topic string, partitionID int) ([]string, error) {
+	partition, err := c.GetPartition(ctx, topic)
+	if err != nil {
+		return nil, err
+	}
+
+	return partition.ISR, nil
+}
+
+// WatchISR 监听 ISR 列表变化
+func (c *ConsulCoordinator) WatchISR(ctx context.Context, topic string, partitionID int) (<-chan []string, error) {
+	ch := make(chan []string)
+
+	go func() {
+		defer close(ch)
+
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			default:
+				partition, err := c.GetPartition(ctx, topic)
+				if err != nil {
+					log.Printf("获取分区信息失败: %v", err)
+					time.Sleep(time.Second)
+					continue
+				}
+
+				ch <- partition.ISR
+
+				time.Sleep(time.Second)
+			}
+		}
+	}()
+
+	return ch, nil
+}
+
+// TopicExists 检查主题是否存在
+func (c *ConsulCoordinator) TopicExists(ctx context.Context, topic string) (bool, error) {
+	key := fmt.Sprintf("lmq/topics/%s", topic)
+	pair, _, err := c.client.KV().Get(key, nil)
+	if err != nil {
+		return false, err
+	}
+	return pair != nil, nil
+}
+
+// Lock 获取分布式锁
+func (c *ConsulCoordinator) Lock(ctx context.Context, key string) error {
+	acquired, err := c.AcquireLock(key, 15*time.Second)
+	if err != nil {
+		return err
+	}
+	if !acquired {
+		return fmt.Errorf("failed to acquire lock: %s", key)
+	}
+	return nil
+}
+
+// Unlock 释放分布式锁
+func (c *ConsulCoordinator) Unlock(ctx context.Context, key string) error {
+	return c.ReleaseLock(key)
 }

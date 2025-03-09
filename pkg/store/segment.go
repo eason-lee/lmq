@@ -8,7 +8,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/eason-lee/lmq/pkg/protocol"
+	"google.golang.org/protobuf/proto"
+	pb "github.com/eason-lee/lmq/proto"
 )
 
 // 错误定义
@@ -26,6 +27,7 @@ type Segment struct {
 	indexFile  *os.File     // 索引文件
 	mu         sync.RWMutex // 段级别的锁
 	index      []MessageIndex
+	dir        string
 }
 
 // MessageIndex 消息索引记录
@@ -69,22 +71,32 @@ func newSegment(dir string, baseOffset int64, maxSize int64) (*Segment, error) {
 		maxSize:    maxSize,
 		dataFile:   dataFile,
 		indexFile:  indexFile,
+		dir:        dir,
 	}, nil
 }
 
 // Write 写入消息到段
-func (s *Segment) Write(msg *protocol.Message) error {
+func (s *Segment) Write(msg *pb.Message) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	// 序列化消息
-	data, err := serializeMessage(msg)
+	data, err := proto.Marshal(msg)
 	if err != nil {
 		return fmt.Errorf("序列化消息失败: %w", err)
 	}
 
+	// 添加消息长度前缀
+	lenBuf := make([]byte, 4)
+	binary.BigEndian.PutUint32(lenBuf, uint32(len(data)))
+
+	// 组合长度和数据
+	msgData := make([]byte, len(lenBuf)+len(data))
+	copy(msgData[:4], lenBuf)
+	copy(msgData[4:], data)
+
 	// 检查段大小
-	if s.size+int64(len(data)) > s.maxSize {
+	if s.size+int64(len(msgData)) > s.maxSize {
 		return ErrSegmentFull
 	}
 
@@ -94,30 +106,30 @@ func (s *Segment) Write(msg *protocol.Message) error {
 		return fmt.Errorf("获取文件位置失败: %w", err)
 	}
 
-	if _, err := s.dataFile.Write(data); err != nil {
+	if _, err := s.dataFile.Write(msgData); err != nil {
 		return fmt.Errorf("写入数据失败: %w", err)
 	}
 
 	// 更新索引
 	timestamp := time.Now().UnixNano()
-	if msg.Message.Timestamp != nil {
-		timestamp = msg.Message.Timestamp.AsTime().UnixNano()
+	if msg.Timestamp != nil {
+		timestamp = msg.Timestamp.AsTime().UnixNano()
 	}
 
 	index := MessageIndex{
 		Offset:    s.baseOffset + int64(len(s.index)),
 		Position:  position,
-		Size:      int32(len(data)),
+		Size:      int32(len(msgData)),
 		Timestamp: timestamp,
 	}
 	s.index = append(s.index, index)
-	s.size += int64(len(data))
+	s.size += int64(len(msgData))
 
 	return nil
 }
 
 // Read 从段读取消息
-func (s *Segment) Read(offset int64, count int) ([]*protocol.Message, error) {
+func (s *Segment) Read(offset int64, count int) ([]*pb.Message, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -132,7 +144,7 @@ func (s *Segment) Read(offset int64, count int) ([]*protocol.Message, error) {
 		return nil, err
 	}
 
-	messages := make([]*protocol.Message, 0, len(indexes))
+	messages := make([]*pb.Message, 0, len(indexes))
 	for _, idx := range indexes {
 		// 读取消息数据
 		data := make([]byte, idx.Size)
@@ -140,9 +152,18 @@ func (s *Segment) Read(offset int64, count int) ([]*protocol.Message, error) {
 			return nil, fmt.Errorf("读取消息数据失败: %w", err)
 		}
 
-		// 使用二进制格式反序列化消息
-		msg, err := deserializeMessage(data)
-		if err != nil {
+		// 读取消息长度
+		if len(data) < 4 {
+			return nil, fmt.Errorf("数据长度不足")
+		}
+		msgLen := binary.BigEndian.Uint32(data[:4])
+		if len(data) < int(msgLen)+4 {
+			return nil, fmt.Errorf("数据长度不匹配")
+		}
+
+		// 反序列化消息
+		msg := &pb.Message{}
+		if err := proto.Unmarshal(data[4:4+msgLen], msg); err != nil {
 			return nil, fmt.Errorf("反序列化消息失败: %w", err)
 		}
 
@@ -267,4 +288,73 @@ func (s *Segment) GetLatestOffset() (int64, error) {
 	// 返回最后一条消息的偏移量
 	lastIndex := s.index[len(s.index)-1]
 	return lastIndex.Offset, nil
+}
+
+// Delete 删除段文件
+func (s *Segment) Delete() error {
+	if err := os.Remove(filepath.Join(s.dir, fmt.Sprintf("%020d%s", s.baseOffset, DataFileSuffix))); err != nil {
+		return fmt.Errorf("删除数据文件失败: %w", err)
+	}
+	if err := os.Remove(filepath.Join(s.dir, fmt.Sprintf("%020d%s", s.baseOffset, IndexFileSuffix))); err != nil {
+		return fmt.Errorf("删除索引文件失败: %w", err)
+	}
+	return nil
+}
+
+// getLastModifiedTime 获取段的最后修改时间
+func (s *Segment) getLastModifiedTime() (time.Time, error) {
+	info, err := s.dataFile.Stat()
+	if err != nil {
+		return time.Time{}, fmt.Errorf("获取数据文件信息失败: %w", err)
+	}
+	return info.ModTime(), nil
+}
+
+// GetOffset 获取指定消息ID的偏移量
+func (s *Segment) GetOffset(messageID string) (int64, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	// 从索引中查找消息
+	for i, entry := range s.index {
+		// 读取消息
+		message, err := s.readMessage(entry.Position, entry.Size)
+		if err != nil {
+			continue
+		}
+
+		// 检查消息ID
+		if message.Id == messageID {
+			return s.baseOffset + int64(i), nil
+		}
+	}
+
+	return 0, fmt.Errorf("消息不存在: %s", messageID)
+}
+
+// readMessage 从指定位置读取消息
+func (s *Segment) readMessage(position int64, size int32) (*pb.Message, error) {
+	// 打开数据文件
+	file := s.dataFile
+	
+	defer file.Close()
+
+	// 定位到消息位置
+	if _, err := file.Seek(position, 0); err != nil {
+		return nil, err
+	}
+
+	// 读取消息数据
+	data := make([]byte, size)
+	if _, err := file.Read(data); err != nil {
+		return nil, err
+	}
+
+	// 解析消息
+	message := &pb.Message{}
+	if err := proto.Unmarshal(data[4:], message); err != nil {
+		return nil, err
+	}
+
+	return message, nil
 }

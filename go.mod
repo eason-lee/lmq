@@ -4,7 +4,7 @@ go 1.23.3
 
 require github.com/hashicorp/consul/api v1.31.2
 
-require github.com/google/uuid v1.6.0 // indirect
+require github.com/google/uuid v1.6.0
 
 require (
 	github.com/armon/go-metrics v0.4.1 // indirect

@@ -242,15 +242,6 @@ func (b *Broker) HandlePublish(ctx context.Context, req *pb.PublishRequest) erro
 	return nil
 }
 
-// crc32Hash 计算字符串的CRC32哈希值
-func crc32Hash(s string) uint32 {
-	var h uint32
-	for i := 0; i < len(s); i++ {
-		h = h*31 + uint32(s[i])
-	}
-	return h
-}
-
 // HandleSubscribe 处理订阅请求
 func (b *Broker) HandleSubscribe(ctx context.Context, req *pb.SubscribeRequest) error {
 	// 检查 group_id 是否为空

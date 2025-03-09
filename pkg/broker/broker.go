@@ -37,7 +37,6 @@ type Subscriber struct {
 // Broker 消息代理，负责消息的路由和分发
 type Broker struct {
 	nodeID          string
-	addr            string
 	store           store.Store
 	subscribers     map[string][]*Subscriber // 主题 -> 订阅者列表
 	mu              sync.RWMutex
@@ -48,7 +47,15 @@ type Broker struct {
 	stopCh          chan struct{}           // 停止信号
 	server          *network.Server         // 网络服务器
 	delayedMsgs     *DelayedMessageQueue    // 延迟消息队列
+	config          *BrokerConfig           // 代理配置
 }
+
+// BrokerConfig 代理配置
+type BrokerConfig struct {
+	addr string
+	DefaultPartitions int // 默认分区数量
+}
+
 
 // DelayedMessageQueue 延迟消息队列
 type DelayedMessageQueue struct {
@@ -130,12 +137,16 @@ func generateStoreDir(nodeID string) string {
 }
 
 // NewBroker 创建新的broker实例
-func NewBroker(addr string) (*Broker, error) {
-	if addr == "" {
-		addr = "0.0.0.0:9000"
+func NewBroker(config *BrokerConfig) (*Broker, error) {
+	// 使用默认配置
+	if config == nil {
+		config = &BrokerConfig{
+			DefaultPartitions: 3, // 默认3个分区
+			addr: "0.0.0.0:9000",
+		}
 	}
 
-	nodeID := generateNodeID(addr)
+	nodeID := generateNodeID(config.addr)
 	storeDir := generateStoreDir(nodeID)
 
 	fileStore, err := store.NewFileStore(storeDir)
@@ -150,22 +161,22 @@ func NewBroker(addr string) (*Broker, error) {
 
 	broker := &Broker{
 		nodeID:          nodeID,
-		addr:            addr,
 		store:           fileStore,
 		subscribers:     make(map[string][]*Subscriber),
 		unackedMessages: make(map[string]*protocol.Message),
 		coordinator:     consulCoord,
 		stopCh:          make(chan struct{}),
 		delayedMsgs:     NewDelayedMessageQueue(),
+		config: config,
 	}
 
-	server, err := network.NewServer(addr, broker)
+	server, err := network.NewServer(config.addr, broker)
 	if err != nil {
 		return nil, fmt.Errorf("创建网络服务器失败: %w", err)
 	}
 	broker.server = server
 
-	broker.clusterMgr = cluster.NewClusterManager(nodeID, addr, fileStore, consulCoord)
+	broker.clusterMgr = cluster.NewClusterManager(nodeID, config.addr, fileStore, consulCoord)
 	broker.clusterMgr.RegisterHandlers(server)
 
 	return broker, nil
@@ -187,7 +198,7 @@ func (b *Broker) Start(ctx context.Context) error {
 	// 启动节点同步任务
 	go b.startNodeSyncTask(ctx, 10*time.Second)
 
-	log.Printf("LMQ broker已启动，节点ID: %s, 监听地址: %s", b.nodeID, b.addr)
+	log.Printf("LMQ broker已启动，节点ID: %s, 监听地址: %s", b.nodeID, b.config.addr)
 
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
@@ -202,12 +213,10 @@ func (b *Broker) Start(ctx context.Context) error {
 
 // HandlePublish 处理发布请求
 func (b *Broker) HandlePublish(ctx context.Context, req *pb.PublishRequest) error {
-	// 检查 topic 是否存在
 	if err := b.checkTopic(req.Topic); err != nil {
 		return err
 	}
 
-	// 构造消息
 	msg := &protocol.Message{
 		Message: &pb.Message{
 			Id:         uuid.New().String(),
@@ -264,7 +273,7 @@ func (b *Broker) HandleSubscribe(ctx context.Context, req *pb.SubscribeRequest) 
 		if !exists {
 			// 主题不存在，自动创建
 			log.Printf("主题 %s 不存在，自动创建", topic)
-			if err := b.coordinator.CreateTopic(ctx, topic, 1); err != nil { // 默认创建1个分区
+			if err := b.coordinator.CreateTopic(ctx, topic, b.config.DefaultPartitions); err != nil { // 默认创建1个分区
 				return fmt.Errorf("自动创建主题失败: %w", err)
 			}
 		}

@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"flag"
 	"log"
 
 	"github.com/eason-lee/lmq/pkg/broker"
@@ -10,11 +9,10 @@ import (
 
 
 func main() {
-	flag.Parse()
 	ctx := context.Background()
 
 	// 创建 broker
-	b, err := broker.NewBroker("")
+	b, err := broker.NewBroker(nil)
 	if err != nil {
 		log.Fatalf("创建broker失败: %v", err)
 	}

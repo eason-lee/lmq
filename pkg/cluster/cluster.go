@@ -716,23 +716,6 @@ func (cm *ClusterManager) replicateToNode(ctx context.Context, nodeID string, to
 }
 
 
-// SelectPartition 选择分区
-func (cm *ClusterManager) SelectPartition(ctx context.Context, topic string, messageID string) (int, error) {
-	// 获取主题的分区数量
-	partitionCount, err := cm.coordinator.GetTopicPartitionCount(ctx, topic)
-	if err != nil {
-		return 0, err
-	}
-
-	// 简单的哈希分区
-	hash := 0
-	for _, c := range messageID {
-		hash = 31*hash + int(c)
-	}
-
-	return (hash & 0x7FFFFFFF) % partitionCount, nil
-}
-
 // SyncNodes 从外部同步节点信息
 func (cm *ClusterManager) SyncNodes(nodes map[string]string) {
 	cm.mu.Lock()

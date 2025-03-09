@@ -219,22 +219,23 @@ func (b *Broker) HandlePublish(ctx context.Context, req *pb.PublishRequest) erro
 		},
 	}
 
-	// 获取主题的所有分区
-	partitions, err := b.coordinator.GetPartitions(ctx, req.Topic)
+	partitionID, err := b.SelectPartition(ctx, req.Topic, msg.Message.Id)
 	if err != nil {
-		return fmt.Errorf("获取分区列表失败: %w", err)
+		return fmt.Errorf("选择分区失败: %w", err)
 	}
 
-	if len(partitions) == 0 {
-		return fmt.Errorf("主题 %s 没有可用分区", req.Topic)
+	// 获取分区信息
+	partition, err := b.coordinator.GetPartition(ctx, req.Topic, partitionID)
+	if err != nil {
+		return fmt.Errorf("获取分区信息失败: %w", err)
 	}
 
-	// 简单的分区选择策略：使用消息ID的哈希值对分区数量取模
-	partitionIndex := int(crc32Hash(msg.Message.Id) % uint32(len(partitions)))
-	partition := partitions[partitionIndex]
+	if partition == nil {
+		return fmt.Errorf("分区 %s-%d 不存在", req.Topic, partitionID)
+	}
 
 	// 写入消息
-	if err := b.store.Write(req.Topic, partition.ID, []*protocol.Message{msg}); err != nil {
+	if err := b.store.Write(req.Topic, partitionID, []*protocol.Message{msg}); err != nil {
 		return fmt.Errorf("写入消息失败: %w", err)
 	}
 
@@ -470,4 +471,21 @@ func (b *Broker) startNodeSyncTask(ctx context.Context, interval time.Duration) 
 			}
 		}
 	}
+}
+
+// SelectPartition 根据消息ID选择分区
+func (b *Broker) SelectPartition(ctx context.Context, topic string, messageID string) (int, error) {
+	// 获取主题的分区数量
+	partitionCount, err := b.coordinator.GetTopicPartitionCount(ctx, topic)
+	if err != nil {
+		return 0, err
+	}
+
+	// 简单的哈希分区
+	hash := 0
+	for _, c := range messageID {
+		hash = 31*hash + int(c)
+	}
+
+	return (hash & 0x7FFFFFFF) % partitionCount, nil
 }

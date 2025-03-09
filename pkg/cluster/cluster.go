@@ -715,15 +715,6 @@ func (cm *ClusterManager) replicateToNode(ctx context.Context, nodeID string, to
 	return nil
 }
 
-// CreateTopic 创建主题
-func (cm *ClusterManager) CreateTopic(ctx context.Context, topic string, partitionCount int) error {
-	return cm.coordinator.CreateTopic(ctx, topic, partitionCount)
-}
-
-// GetPartitionLeader 获取分区的 leader 节点
-func (cm *ClusterManager) GetPartitionLeader(ctx context.Context, topic string, partition int) (string, error) {
-	return cm.coordinator.GetPartitionLeader(ctx, topic, partition)
-}
 
 // SelectPartition 选择分区
 func (cm *ClusterManager) SelectPartition(ctx context.Context, topic string, messageID string) (int, error) {

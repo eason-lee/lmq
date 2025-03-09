@@ -183,6 +183,9 @@ func (b *Broker) Start(ctx context.Context) error {
 
 	// 启动延迟消息处理器
 	b.StartDelayedMessageProcessor(1 * time.Second)
+	
+	// 启动节点同步任务
+	go b.startNodeSyncTask(ctx, 10*time.Second)
 
 	log.Printf("LMQ broker已启动，节点ID: %s, 监听地址: %s", b.nodeID, b.addr)
 
@@ -259,10 +262,19 @@ func (b *Broker) HandleSubscribe(ctx context.Context, req *pb.SubscribeRequest) 
 		return fmt.Errorf("topics 不能为空")
 	}
 
-	// 检查每个 topic 是否存在
+	// 检查每个 topic 是否存在，如果不存在则创建
 	for _, topic := range req.Topics {
-		if err := b.checkTopic(topic); err != nil {
-			return err
+		exists, err := b.coordinator.TopicExists(ctx, topic)
+		if err != nil {
+			return fmt.Errorf("检查主题是否存在失败: %w", err)
+		}
+
+		if !exists {
+			// 主题不存在，自动创建
+			log.Printf("主题 %s 不存在，自动创建", topic)
+			if err := b.coordinator.CreateTopic(ctx, topic, 1); err != nil { // 默认创建1个分区
+				return fmt.Errorf("自动创建主题失败: %w", err)
+			}
 		}
 	}
 

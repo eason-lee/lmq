@@ -1,6 +1,6 @@
 # LMQ - 分布式轻量级消息队列
 
-LMQ 是一个用 Go 语言实现的分布式轻量级消息队列系统，旨在提供可扩展、高可用的消息传递功能。
+LMQ 是一个用 Go 语言实现的分布式轻量级消息队列系统，旨在提供可扩展、高可用的消息传递功能。项目参考了Kafka的设计理念，实现了基本的消息发布-订阅模型，支持主题分区和消费者组等核心功能。
 
 ## 系统架构
 
@@ -85,81 +85,6 @@ LMQ 是一个用 Go 语言实现的分布式轻量级消息队列系统，旨在
 - 零拷贝传输
 - 页面缓存优化
 
-## 技术实现
-
-### 1. 集群协调 (Consul)
-
-```go
-type ClusterCoordinator interface {
-    // 服务注册与发现
-    RegisterService(service *ServiceInfo) error
-    DiscoverService(serviceName string) ([]*ServiceInfo, error)
-    
-    // 领导者选举
-    ElectLeader(serviceName string) (bool, error)
-    WatchLeader(serviceName string) (<-chan string, error)
-    
-    // 配置管理
-    PutConfig(key string, value []byte) error
-    GetConfig(key string) ([]byte, error)
-    WatchConfig(key string) (<-chan []byte, error)
-    
-    // 分布式锁
-    AcquireLock(key string) (bool, error)
-    ReleaseLock(key string) error
-}
-```
-
-### 2. 消息分区
-
-```go
-type PartitionManager interface {
-    // 创建分区
-    CreatePartition(topic string, partitionID int) error
-    
-    // 分配分区
-    AssignPartition(partition string, broker string) error
-    
-    // 获取分区信息
-    GetPartitionInfo(topic string, partitionID int) (*PartitionInfo, error)
-    
-    // 监控分区状态
-    WatchPartitions() (<-chan PartitionEvent, error)
-}
-```
-
-### 3. 复制机制
-
-```go
-type ReplicationManager interface {
-    // 复制数据到副本
-    Replicate(topic string, partition int, messages []*Message) error
-    
-    // 同步数据
-    Sync(topic string, partition int) error
-    
-    // 检查复制状态
-    CheckReplicationStatus(topic string, partition int) (*ReplicationStatus, error)
-}
-```
-
-### 4. 存储引擎
-
-```go
-type StorageEngine interface {
-    // 写入消息
-    Write(partition string, messages []*Message) error
-    
-    // 读取消息
-    Read(partition string, offset int64, count int) ([]*Message, error)
-    
-    // 获取分区信息
-    GetPartitionMeta(partition string) (*PartitionMeta, error)
-    
-    // 清理过期数据
-    Cleanup(partition string) error
-}
-```
 
 ## 部署架构
 
@@ -170,18 +95,6 @@ type StorageEngine interface {
 - 每个主题默认 3 个分区
 - 复制因子 2（1 个主副本 + 1 个从副本）
 
-### 推荐配置
-
-- 硬件配置
-  - CPU: 8+ 核
-  - 内存: 16GB+
-  - 磁盘: SSD
-  - 网络: 1Gbps+
-
-- 软件配置
-  - 操作系统: Linux
-  - 文件系统: ext4/xfs
-  - 内核参数优化
 
 ### 扩展建议
 
@@ -213,35 +126,81 @@ type StorageEngine interface {
 - 连接数
 - 错误率
 
+## 参考Kafka设计的优化方向
+
+基于对当前LMQ系统的分析，参照Kafka的设计理念，我们需要在以下几个方面进行优化：
+
+### 1. 存储与分区优化
+
+- **日志结构存储**：采用类似Kafka的日志结构存储格式，将消息顺序追加到文件中，提高写入性能
+- **分段文件管理**：将分区数据拆分为多个分段文件，便于清理过期数据
+- **索引机制改进**：实现稀疏索引和二分查找，加速消息检索
+- **分区动态扩展**：支持在线增加分区数量，无需重启服务
+- **分区重平衡**：实现自动分区重平衡算法，优化集群资源利用
+
+### 2. 高可用与容错增强
+
+- **ISR机制**：实现In-Sync Replicas机制，提高数据可靠性
+- **Leader选举优化**：改进Leader选举算法，减少选举时间
+- **副本同步策略**：支持同步和异步复制策略，平衡可靠性和性能
+- **优雅降级**：在部分节点故障时保持服务可用性
+- **数据一致性保证**：提供不同级别的一致性保证（至少一次、最多一次、精确一次）
+
+### 3. 性能优化
+
+- **批量处理增强**：优化批量发送和接收机制，减少网络开销
+- **消息压缩**：支持多种压缩算法（Gzip, Snappy, LZ4），减少存储和网络带宽
+- **零拷贝传输**：使用sendfile等系统调用实现零拷贝，提高传输效率
+- **页缓存利用**：优化文件读写以充分利用操作系统页缓存
+- **异步I/O**：使用异步I/O操作提高并发处理能力
+
+### 4. 消费者组机制完善
+
+- **再平衡协议**：实现完整的消费者组再平衡协议，支持动态加入/离开
+- **偏移量管理**：改进消费偏移量的存储和管理机制
+- **消费者心跳**：实现消费者心跳机制，及时检测消费者故障
+- **静态成员**：支持静态成员ID，减少不必要的再平衡
+- **增量再平衡**：实现增量再平衡算法，减少再平衡对消费的影响
+
+### 5. 监控与运维
+
+- **指标收集系统**：构建完整的指标收集系统，支持Prometheus集成
+- **告警机制**：实现多级告警机制，及时发现系统异常
+- **管理API**：提供完整的管理API，支持动态配置调整
+- **可视化控制台**：开发Web控制台，简化集群管理和监控
+- **配额管理**：实现生产者和消费者的配额管理，防止资源滥用
+
 ## 开发路线图
 
-### 第一阶段：基础框架
+### 第一阶段：基础框架（已完成）
 
 1. Consul 集成
 2. Broker 节点服务
 3. 基础存储引擎
 4. 简单的客户端 SDK
 
-### 第二阶段：核心功能
+### 第二阶段：核心功能（进行中）
 
-1. 分区管理
-2. 复制机制
-3. 消息确认
-4. 故障转移
+1. 分区管理优化
+2. 复制机制完善
+3. 消息确认机制增强
+4. 故障转移自动化
 
-### 第三阶段：高级特性
+### 第三阶段：高级特性（计划中）
 
 1. 事务支持
 2. 消息过滤
-3. 延迟队列
+3. 延迟队列增强
 4. 死信队列
+5. 消费者组再平衡协议
 
-### 第四阶段：性能优化
+### 第四阶段：性能优化（计划中）
 
-1. 批量处理
-2. 消息压缩
-3. 零拷贝
-4. 缓存优化
+1. 批量处理增强
+2. 多种压缩算法支持
+3. 零拷贝传输实现
+4. 页缓存优化
+5. 异步I/O改进
 
 ## 使用示例
 
@@ -250,12 +209,9 @@ type StorageEngine interface {
 ```go
 func main() {
     // 配置 Broker
-    config := &broker.Config{
-        NodeID:    "broker-1",
-        DataDir:   "/data/lmq",
-        ConsulConfig: &consul.Config{
-            Address: "localhost:8500",
-        },
+    config := &broker.BrokerConfig{
+        DefaultPartitions: 3,
+        addr:              "0.0.0.0:9000",
     }
     
     // 创建并启动 Broker
@@ -264,7 +220,11 @@ func main() {
         log.Fatal(err)
     }
     
-    broker.Start()
+    // 使用上下文控制生命周期
+    ctx := context.Background()
+    if err := broker.Start(ctx); err != nil {
+        log.Fatal(err)
+    }
 }
 ```
 
@@ -272,19 +232,60 @@ func main() {
 
 ```go
 func main() {
-    // 创建生产者
-    producer, err := lmq.NewProducer(&lmq.ProducerConfig{
-        Brokers: []string{"localhost:9000"},
+    // 创建LMQ客户端
+    client, err := lmq.NewClient(&lmq.Config{
+        Brokers:    []string{"localhost:9000"},
+        RetryTimes: 3,
+        Timeout:    5 * time.Second,
+    })
+    if err != nil {
+        log.Fatal(err)
+    }
+    defer client.Close()
+    
+    // 订阅主题
+    err = client.Subscribe([]string{"test-topic"}, func(messages []*protocol.Message) {
+        for _, msg := range messages {
+            fmt.Printf("收到消息: ID=%s, Topic=%s, Content=%s\n",
+                msg.Message.Id, msg.Message.Topic, string(msg.Message.Body))
+            
+            // 如果未启用自动提交，需要手动确认消息
+            if !client.config.AutoCommit {
+                // 手动确认消息处理完成
+                // 这里可以实现自定义的确认逻辑
+            }
+        }
     })
     if err != nil {
         log.Fatal(err)
     }
     
+    // 保持程序运行，等待消息
+    fmt.Println("消费者已启动，等待消息...")
+    select {}
+}
+    
     // 发送消息
-    err = producer.Send("test-topic", []byte("Hello, LMQ!"))
+    result, err := client.Send("test-topic", []byte("Hello, LMQ!"))
     if err != nil {
         log.Fatal(err)
     }
+    
+    fmt.Printf("消息已发送: ID=%s, Topic=%s, Partition=%d\n", 
+        result.MessageID, result.Topic, result.Partition)
+    
+    // 批量发送消息
+    messages := [][]byte{
+        []byte("Message 1"),
+        []byte("Message 2"),
+        []byte("Message 3"),
+    }
+    results, err := client.SendBatch("test-topic", messages)
+    if err != nil {
+        log.Fatal(err)
+    }
+    
+    fmt.Printf("已发送 %d 条消息\n", len(results))
 }
 ```
 
@@ -292,14 +293,41 @@ func main() {
 
 ```go
 func main() {
-    // 创建消费者
-    consumer, err := lmq.NewConsumer(&lmq.ConsumerConfig{
-        Brokers: []string{"localhost:9000"},
-        Group:   "test-group",
+    // 创建LMQ客户端
+    client, err := lmq.NewClient(&lmq.Config{
+        Brokers:        []string{"localhost:9000"},
+        GroupID:        "test-group",
+        AutoCommit:     true,
+        CommitInterval: 5 * time.Second,
+        MaxPullRecords: 100,
+        PullInterval:   1 * time.Second,
     })
     if err != nil {
         log.Fatal(err)
     }
+    defer client.Close()
+    
+    // 订阅主题
+    err = client.Subscribe([]string{"test-topic"}, func(messages []*protocol.Message) {
+        for _, msg := range messages {
+            fmt.Printf("收到消息: ID=%s, Topic=%s, Content=%s\n",
+                msg.Message.Id, msg.Message.Topic, string(msg.Message.Body))
+            
+            // 如果未启用自动提交，需要手动确认消息
+            if !client.config.AutoCommit {
+                // 手动确认消息处理完成
+                // 这里可以实现自定义的确认逻辑
+            }
+        }
+    })
+    if err != nil {
+        log.Fatal(err)
+    }
+    
+    // 保持程序运行，等待消息
+    fmt.Println("消费者已启动，等待消息...")
+    select {}
+}
     
     // 订阅主题
     err = consumer.Subscribe("test-topic", func(msg *lmq.Message) error {

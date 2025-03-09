@@ -22,6 +22,18 @@ type Partition struct {
 	mu             sync.RWMutex
 }
 
+func (p *Partition) GetActiveSegment() *Segment {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return p.activeSegment
+}
+
+func (p *Partition) GetSegments() []*Segment {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return p.segments
+}
+
 // NewPartition 创建新的分区实例
 func NewPartition(dir string) (*Partition, error) {
 	// 创建分区目录

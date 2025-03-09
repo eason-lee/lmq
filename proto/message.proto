@@ -29,6 +29,7 @@ message Message {
   MessageType type = 5;
   map<string, google.protobuf.Any> attributes = 6;
   int32 version = 7;
+  int32 partition = 8;
 }
 
 // 请求类型

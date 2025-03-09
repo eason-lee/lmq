@@ -28,6 +28,7 @@ type Segment struct {
 	mu         sync.RWMutex // 段级别的锁
 	index      []MessageIndex
 	dir        string
+	ct time.Time
 }
 
 // MessageIndex 消息索引记录
@@ -72,6 +73,7 @@ func newSegment(dir string, baseOffset int64, maxSize int64) (*Segment, error) {
 		dataFile:   dataFile,
 		indexFile:  indexFile,
 		dir:        dir,
+		ct: time.Now(),
 	}, nil
 }
 

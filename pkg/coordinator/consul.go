@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"log"
 	"path"
 	"strconv"
 	"strings"
@@ -358,8 +357,8 @@ func (c *ConsulCoordinator) CreatePartition(partition *PartitionInfo) error {
 }
 
 // GetPartition 获取分区信息
-func (c *ConsulCoordinator) GetPartition(ctx context.Context, topic string) (*PartitionInfo, error) {
-	key := fmt.Sprintf("topics/%s/partitions/0", topic)
+func (c *ConsulCoordinator) GetPartition(ctx context.Context, topic string, partitionID int) (*PartitionInfo, error) {
+	key := fmt.Sprintf("topics/%s/partitions/%d", topic, partitionID)
 	pair, _, err := c.client.KV().Get(key, nil)
 	if err != nil {
 		return nil, fmt.Errorf("获取分区信息失败: %w", err)
@@ -399,7 +398,7 @@ func (c *ConsulCoordinator) GetPartitions(ctx context.Context, topic string) ([]
 
 // GetPartitionLeader 获取分区的leader节点
 func (c *ConsulCoordinator) GetPartitionLeader(ctx context.Context, topic string, partitionID int) (string, error) {
-	partition, err := c.GetPartition(ctx, topic)
+	partition, err := c.GetPartition(ctx, topic, partitionID)
 	if err != nil {
 		return "", err
 	}
@@ -596,16 +595,6 @@ func (c *ConsulCoordinator) DeleteTopic(ctx context.Context, topic string) error
 
 // ElectPartitionLeader 为分区选举leader
 func (c *ConsulCoordinator) ElectPartitionLeader(ctx context.Context, topic string, partitionID int, nodeID string) (bool, error) {
-	// 获取分区信息
-	partition, err := c.GetPartition(ctx, topic)
-	if err != nil {
-		return false, err
-	}
-
-	if partition == nil {
-		return false, fmt.Errorf("分区不存在: %s-%d", topic, partitionID)
-	}
-
 	// 创建会话
 	session, _, err := c.client.Session().Create(&api.SessionEntry{
 		Name:     fmt.Sprintf("lmq-partition-leader-%s-%d", topic, partitionID),
@@ -630,38 +619,26 @@ func (c *ConsulCoordinator) ElectPartitionLeader(ctx context.Context, topic stri
 	}
 
 	if acquired {
-		// 更新分区元数据
+		// 获取分区信息
+		partition, err := c.GetPartition(ctx, topic, partitionID)
+		if err != nil {
+			// 如果获取分区信息失败，释放锁
+			c.client.KV().Release(&api.KVPair{
+				Key:     key,
+				Session: session,
+			}, nil)
+			return false, err
+		}
+
+		// 更新分区leader
 		partition.Leader = nodeID
-
-		// 如果节点在followers中，将其移除
-		var newFollowers []string
-		for _, f := range partition.Followers {
-			if f != nodeID {
-				newFollowers = append(newFollowers, f)
-			}
-		}
-		partition.Followers = newFollowers
-
-		// 确保节点在ISR中
-		inISR := false
-		for _, isr := range partition.ISR {
-			if isr == nodeID {
-				inISR = true
-				break
-			}
-		}
-		if !inISR {
-			partition.ISR = append(partition.ISR, nodeID)
-		}
-
-		// 更新分区信息
 		if err := c.UpdatePartition(partition); err != nil {
 			// 如果更新失败，释放锁
 			c.client.KV().Release(&api.KVPair{
 				Key:     key,
 				Session: session,
 			}, nil)
-			return false, fmt.Errorf("更新分区信息失败: %w", err)
+			return false, err
 		}
 
 		// 保存会话ID
@@ -701,17 +678,16 @@ func (c *ConsulCoordinator) ResignPartitionLeader(ctx context.Context, topic str
 
 // IsPartitionLeader 检查节点是否是分区的leader
 func (c *ConsulCoordinator) IsPartitionLeader(ctx context.Context, topic string, partitionID int, nodeID string) (bool, error) {
-	key := fmt.Sprintf("lmq/partition-leaders/%s/%d", topic, partitionID)
-	pair, _, err := c.client.KV().Get(key, nil)
+	partition, err := c.GetPartition(ctx, topic, partitionID)
 	if err != nil {
 		return false, err
 	}
 
-	if pair == nil {
-		return false, nil
+	if partition == nil {
+		return false, fmt.Errorf("分区不存在: %s-%d", topic, partitionID)
 	}
 
-	return string(pair.Value) == nodeID, nil
+	return partition.Leader == nodeID, nil
 }
 
 // RegisterReplicaStatus 注册副本状态
@@ -1045,7 +1021,7 @@ func parseOffset(messageID string) int64 {
 
 // AddToISR 添加节点到 ISR 列表
 func (c *ConsulCoordinator) AddToISR(ctx context.Context, topic string, partitionID int, nodeID string) error {
-	partition, err := c.GetPartition(ctx, topic)
+	partition, err := c.GetPartition(ctx, topic, partitionID)
 	if err != nil {
 		return err
 	}
@@ -1066,7 +1042,7 @@ func (c *ConsulCoordinator) AddToISR(ctx context.Context, topic string, partitio
 
 // RemoveFromISR 从 ISR 列表中移除节点
 func (c *ConsulCoordinator) RemoveFromISR(ctx context.Context, topic string, partitionID int, nodeID string) error {
-	partition, err := c.GetPartition(ctx, topic)
+	partition, err := c.GetPartition(ctx, topic, partitionID)
 	if err != nil {
 		return err
 	}
@@ -1086,7 +1062,7 @@ func (c *ConsulCoordinator) RemoveFromISR(ctx context.Context, topic string, par
 
 // GetISR 获取 ISR 列表
 func (c *ConsulCoordinator) GetISR(ctx context.Context, topic string, partitionID int) ([]string, error) {
-	partition, err := c.GetPartition(ctx, topic)
+	partition, err := c.GetPartition(ctx, topic, partitionID)
 	if err != nil {
 		return nil, err
 	}
@@ -1094,9 +1070,9 @@ func (c *ConsulCoordinator) GetISR(ctx context.Context, topic string, partitionI
 	return partition.ISR, nil
 }
 
-// WatchISR 监听 ISR 列表变化
+// WatchISR 监听ISR列表变化
 func (c *ConsulCoordinator) WatchISR(ctx context.Context, topic string, partitionID int) (<-chan []string, error) {
-	ch := make(chan []string)
+	ch := make(chan []string, 1)
 
 	go func() {
 		defer close(ch)
@@ -1106,14 +1082,15 @@ func (c *ConsulCoordinator) WatchISR(ctx context.Context, topic string, partitio
 			case <-ctx.Done():
 				return
 			default:
-				partition, err := c.GetPartition(ctx, topic)
+				partition, err := c.GetPartition(ctx, topic, partitionID)
 				if err != nil {
-					log.Printf("获取分区信息失败: %v", err)
 					time.Sleep(time.Second)
 					continue
 				}
 
-				ch <- partition.ISR
+				if partition != nil {
+					ch <- partition.ISR
+				}
 
 				time.Sleep(time.Second)
 			}
@@ -1148,4 +1125,19 @@ func (c *ConsulCoordinator) Lock(ctx context.Context, key string) error {
 // Unlock 释放分布式锁
 func (c *ConsulCoordinator) Unlock(ctx context.Context, key string) error {
 	return c.ReleaseLock(key)
+}
+
+// UpdateISR 更新ISR列表
+func (c *ConsulCoordinator) UpdateISR(ctx context.Context, topic string, partitionID int, isr []string) error {
+	partition, err := c.GetPartition(ctx, topic, partitionID)
+	if err != nil {
+		return err
+	}
+
+	if partition == nil {
+		return fmt.Errorf("分区不存在: %s-%d", topic, partitionID)
+	}
+
+	partition.ISR = isr
+	return c.UpdatePartition(partition)
 }

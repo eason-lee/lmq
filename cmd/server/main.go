@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"log"
 
@@ -10,13 +11,14 @@ import (
 
 func main() {
 	flag.Parse()
+	ctx := context.Background()
 
 	// 创建 broker
 	b, err := broker.NewBroker("")
 	if err != nil {
 		log.Fatalf("创建broker失败: %v", err)
 	}
-	if err:=  b.Start(); err != nil {
+	if err:=  b.Start(ctx); err != nil {
 		log.Fatalf("启动broker失败: %v", err)
 	}
 

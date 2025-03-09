@@ -1,6 +1,7 @@
 package cluster
 
 import (
+	"context"
 	"fmt"
 	"log"
 	"sync"
@@ -182,6 +183,8 @@ func (cm *ClusterManager) handleNodeLeaveRequest(req *pb.Request) *pb.Response {
 
 // handleReplicationRequest 处理复制请求
 func (cm *ClusterManager) handleReplicationRequest(req *pb.Request) *pb.Response {
+	ctx := context.Background()
+
 	// 从 request_data 字段获取复制数据
 	if req.GetRequestData() == nil || req.GetPublishData() == nil {
 		return &pb.Response{
@@ -231,7 +234,7 @@ func (cm *ClusterManager) handleReplicationRequest(req *pb.Request) *pb.Response
 	offset := int64(0) // 这里需要从存储中获取实际的偏移量
 
 	// 注册副本状态
-	if err := cm.coordinator.RegisterReplicaStatus(topic, partition, cm.localNodeID, offset); err != nil {
+	if err := cm.coordinator.RegisterReplicaStatus(ctx, topic, partition, cm.localNodeID, offset); err != nil {
 		log.Printf("注册副本状态失败: %v", err)
 	}
 
@@ -270,7 +273,7 @@ func (cm *ClusterManager) getClient(nodeID string) (*network.Client, error) {
 }
 
 // Start 启动集群管理器
-func (cm *ClusterManager) Start() error {
+func (cm *ClusterManager) Start(ctx context.Context) error {
 	// 添加本地节点
 	cm.mu.Lock()
 	cm.nodes[cm.localNodeID] = &Node{
@@ -282,14 +285,7 @@ func (cm *ClusterManager) Start() error {
 	cm.mu.Unlock()
 
 	// 注册服务
-	err := cm.coordinator.RegisterService(&coordinator.ServiceInfo{
-		ID:      cm.localNodeID,
-		Name:    "lmq-broker",
-		Address: cm.localAddr,
-		Port:    9000, // 假设端口是9000
-		Tags:    []string{"broker"},
-		Meta:    map[string]string{"version": "1.0"},
-	})
+	err := cm.coordinator.RegisterService(ctx, cm.localNodeID, cm.localAddr)
 	if err != nil {
 		return fmt.Errorf("注册服务失败: %w", err)
 	}
@@ -307,11 +303,11 @@ func (cm *ClusterManager) Start() error {
 }
 
 // Stop 停止集群管理器
-func (cm *ClusterManager) Stop() error {
+func (cm *ClusterManager) Stop(ctx context.Context) error {
 	close(cm.stopCh)
 
 	// 注销服务
-	if err := cm.coordinator.DeregisterService(cm.localNodeID); err != nil {
+	if err := cm.coordinator.UnregisterService(ctx, cm.localNodeID, cm.localAddr); err != nil {
 		log.Printf("注销服务失败: %v", err)
 	}
 
@@ -433,10 +429,12 @@ func (cm *ClusterManager) checkNodeStatus() {
 	}
 }
 
-// 处理节点宕机
+// handleNodeFailure 处理节点宕机
 func (cm *ClusterManager) handleNodeFailure(nodeID string) {
+	ctx := context.Background()
+
 	// 获取该节点作为 leader 的所有分区
-	partitions, err := cm.coordinator.GetLeaderPartitions(nodeID)
+	partitions, err := cm.coordinator.GetLeaderPartitions(ctx, nodeID)
 	if err != nil {
 		log.Printf("获取节点 %s 的 leader 分区失败: %v", nodeID, err)
 		return
@@ -445,16 +443,16 @@ func (cm *ClusterManager) handleNodeFailure(nodeID string) {
 	// 对每个分区进行 leader 选举
 	for _, p := range partitions {
 		// 尝试成为新的 leader
-		if cm.tryBecomeLeader(p.Topic, p.ID) {
+		if cm.tryBecomeLeader(ctx, p.Topic, p.ID) {
 			log.Printf("成为分区 %s-%d 的新 leader", p.Topic, p.ID)
 		}
 	}
 }
 
-// 尝试成为分区的 leader
-func (cm *ClusterManager) tryBecomeLeader(topic string, partitionID int) bool {
+// tryBecomeLeader 尝试成为分区的 leader
+func (cm *ClusterManager) tryBecomeLeader(ctx context.Context, topic string, partitionID int) bool {
 	// 检查当前节点是否在 ISR 中
-	partition, err := cm.coordinator.GetPartition(topic, partitionID)
+	partition, err := cm.coordinator.GetPartition(ctx, topic, partitionID)
 	if err != nil {
 		log.Printf("获取分区 %s-%d 信息失败: %v", topic, partitionID, err)
 		return false
@@ -480,7 +478,7 @@ func (cm *ClusterManager) tryBecomeLeader(topic string, partitionID int) bool {
 	}
 
 	// 尝试选举为 leader
-	elected, err := cm.coordinator.ElectPartitionLeader(topic, partitionID, cm.localNodeID)
+	elected, err := cm.coordinator.ElectPartitionLeader(ctx, topic, partitionID, cm.localNodeID)
 	if err != nil {
 		log.Printf("选举分区 %s-%d 的 leader 失败: %v", topic, partitionID, err)
 		return false
@@ -506,8 +504,10 @@ func (cm *ClusterManager) monitorPartitions() {
 
 // syncPartitions 同步分区信息
 func (cm *ClusterManager) syncPartitions() {
+	ctx := context.Background()
+
 	// 获取当前节点负责的所有分区
-	partitions, err := cm.coordinator.GetNodePartitions(cm.localNodeID)
+	partitions, err := cm.coordinator.GetNodePartitions(ctx, cm.localNodeID)
 	if err != nil {
 		log.Printf("获取节点分区失败: %v", err)
 		return
@@ -519,21 +519,21 @@ func (cm *ClusterManager) syncPartitions() {
 		offset := int64(0) // 这里需要实现获取最新消息ID的方法
 
 		// 注册副本状态
-		if err := cm.coordinator.RegisterReplicaStatus(partition.Topic, partition.ID, cm.localNodeID, offset); err != nil {
+		if err := cm.coordinator.RegisterReplicaStatus(ctx, partition.Topic, partition.ID, cm.localNodeID, offset); err != nil {
 			log.Printf("注册副本状态失败: %v", err)
 		}
 
 		// 如果是 leader，检查 follower 的复制状态
 		if partition.Leader == cm.localNodeID {
-			cm.checkFollowerStatus(partition)
+			cm.checkFollowerStatus(ctx, partition)
 		}
 	}
 }
 
-// 检查 follower 的复制状态
-func (cm *ClusterManager) checkFollowerStatus(partition *coordinator.PartitionInfo) {
+// checkFollowerStatus 检查 follower 的复制状态
+func (cm *ClusterManager) checkFollowerStatus(ctx context.Context, partition *coordinator.PartitionInfo) {
 	// 获取所有副本的状态
-	replicaStatus, err := cm.coordinator.GetAllReplicaStatus(partition.Topic, partition.ID)
+	replicaStatus, err := cm.coordinator.GetAllReplicaStatus(ctx, partition.Topic, partition.ID)
 	if err != nil {
 		log.Printf("获取分区 %s-%d 的副本状态失败: %v", partition.Topic, partition.ID, err)
 		return
@@ -566,7 +566,7 @@ func (cm *ClusterManager) checkFollowerStatus(partition *coordinator.PartitionIn
 	// 更新 ISR
 	if !equalStringSlices(partition.ISR, newISR) {
 		log.Printf("更新分区 %s-%d 的 ISR: %v -> %v", partition.Topic, partition.ID, partition.ISR, newISR)
-		if err := cm.coordinator.UpdateISR(partition.Topic, partition.ID, newISR); err != nil {
+		if err := cm.coordinator.UpdateISR(ctx, partition.Topic, partition.ID, newISR); err != nil {
 			log.Printf("更新 ISR 失败: %v", err)
 		}
 	}
@@ -595,9 +595,9 @@ func equalStringSlices(a, b []string) bool {
 }
 
 // ReplicateMessages 复制消息到其他节点
-func (cm *ClusterManager) ReplicateMessages(topic string, partition int, messages []*protocol.Message) error {
+func (cm *ClusterManager) ReplicateMessages(ctx context.Context, topic string, partition int, messages []*protocol.Message) error {
 	// 检查当前节点是否是 leader
-	isLeader, err := cm.coordinator.IsPartitionLeader(topic, partition, cm.localNodeID)
+	isLeader, err := cm.coordinator.IsPartitionLeader(ctx, topic, partition, cm.localNodeID)
 	if err != nil {
 		return fmt.Errorf("检查 leader 状态失败: %w", err)
 	}
@@ -607,7 +607,7 @@ func (cm *ClusterManager) ReplicateMessages(topic string, partition int, message
 	}
 
 	// 获取分区信息
-	partitionInfo, err := cm.coordinator.GetPartition(topic, partition)
+	partitionInfo, err := cm.coordinator.GetPartition(ctx, topic, partition)
 	if err != nil {
 		return fmt.Errorf("获取分区信息失败: %w", err)
 	}
@@ -625,7 +625,7 @@ func (cm *ClusterManager) ReplicateMessages(topic string, partition int, message
 	offset := int64(0) // 这里需要实现获取最新消息ID的方法
 
 	// 更新自己的复制状态
-	if err := cm.coordinator.RegisterReplicaStatus(topic, partition, cm.localNodeID, offset); err != nil {
+	if err := cm.coordinator.RegisterReplicaStatus(ctx, topic, partition, cm.localNodeID, offset); err != nil {
 		log.Printf("注册副本状态失败: %v", err)
 	}
 
@@ -638,7 +638,7 @@ func (cm *ClusterManager) ReplicateMessages(topic string, partition int, message
 		go func(nodeID string) {
 			defer wg.Done()
 
-			err := cm.replicateToNode(nodeID, topic, partition, messages)
+			err := cm.replicateToNode(ctx, nodeID, topic, partition, messages)
 			if err != nil {
 				errors <- fmt.Errorf("复制到节点 %s 失败: %w", nodeID, err)
 			}
@@ -670,7 +670,7 @@ func (cm *ClusterManager) ReplicateMessages(topic string, partition int, message
 }
 
 // replicateToNode 复制消息到指定节点
-func (cm *ClusterManager) replicateToNode(nodeID string, topic string, partition int, messages []*protocol.Message) error {
+func (cm *ClusterManager) replicateToNode(ctx context.Context, nodeID string, topic string, partition int, messages []*protocol.Message) error {
 	client, err := cm.getClient(nodeID)
 	if err != nil {
 		return err
@@ -716,19 +716,19 @@ func (cm *ClusterManager) replicateToNode(nodeID string, topic string, partition
 }
 
 // CreateTopic 创建主题
-func (cm *ClusterManager) CreateTopic(topic string, partitionCount int) error {
-	return cm.coordinator.CreateTopic(topic, partitionCount)
+func (cm *ClusterManager) CreateTopic(ctx context.Context, topic string, partitionCount int) error {
+	return cm.coordinator.CreateTopic(ctx, topic, partitionCount)
 }
 
 // GetPartitionLeader 获取分区的 leader 节点
-func (cm *ClusterManager) GetPartitionLeader(topic string, partition int) (string, error) {
-	return cm.coordinator.GetPartitionLeader(topic, partition)
+func (cm *ClusterManager) GetPartitionLeader(ctx context.Context, topic string, partition int) (string, error) {
+	return cm.coordinator.GetPartitionLeader(ctx, topic, partition)
 }
 
 // SelectPartition 选择分区
-func (cm *ClusterManager) SelectPartition(topic string, messageID string) (int, error) {
+func (cm *ClusterManager) SelectPartition(ctx context.Context, topic string, messageID string) (int, error) {
 	// 获取主题的分区数量
-	partitionCount, err := cm.coordinator.GetTopicPartitionCount(topic)
+	partitionCount, err := cm.coordinator.GetTopicPartitionCount(ctx, topic)
 	if err != nil {
 		return 0, err
 	}

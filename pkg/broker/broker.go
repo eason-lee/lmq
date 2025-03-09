@@ -172,12 +172,12 @@ func NewBroker(addr string) (*Broker, error) {
 }
 
 // Start 启动broker服务
-func (b *Broker) Start() error {
+func (b *Broker) Start(ctx context.Context) error {
 	if err := b.server.Start(); err != nil {
 		return fmt.Errorf("启动网络服务器失败: %w", err)
 	}
 
-	if err := b.clusterMgr.Start(); err != nil {
+	if err := b.clusterMgr.Start(ctx); err != nil {
 		return err
 	}
 
@@ -216,11 +216,19 @@ func (b *Broker) HandlePublish(ctx context.Context, req *pb.PublishRequest) erro
 		},
 	}
 
-	// 获取分区
-	partition, err := b.coordinator.GetPartition(ctx, req.Topic)
+	// 获取主题的所有分区
+	partitions, err := b.coordinator.GetPartitions(ctx, req.Topic)
 	if err != nil {
-		return fmt.Errorf("获取分区失败: %w", err)
+		return fmt.Errorf("获取分区列表失败: %w", err)
 	}
+
+	if len(partitions) == 0 {
+		return fmt.Errorf("主题 %s 没有可用分区", req.Topic)
+	}
+
+	// 简单的分区选择策略：使用消息ID的哈希值对分区数量取模
+	partitionIndex := int(crc32Hash(msg.Message.Id) % uint32(len(partitions)))
+	partition := partitions[partitionIndex]
 
 	// 写入消息
 	if err := b.store.Write(req.Topic, partition.ID, []*protocol.Message{msg}); err != nil {
@@ -228,6 +236,15 @@ func (b *Broker) HandlePublish(ctx context.Context, req *pb.PublishRequest) erro
 	}
 
 	return nil
+}
+
+// crc32Hash 计算字符串的CRC32哈希值
+func crc32Hash(s string) uint32 {
+	var h uint32
+	for i := 0; i < len(s); i++ {
+		h = h*31 + uint32(s[i])
+	}
+	return h
 }
 
 // HandleSubscribe 处理订阅请求

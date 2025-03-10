@@ -8,7 +8,6 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"time"
 
 	pb "github.com/eason-lee/lmq/proto"
 )
@@ -228,29 +227,35 @@ func (p *Partition) Close() error {
 	return nil
 }
 
-// CleanupSegments 清理过期的段
-func (p *Partition) CleanupSegments(retention time.Duration) error {
+// ApplyCleanupPolicy 应用清理策略清理段
+func (p *Partition) ApplyCleanupPolicy(policy CleanupPolicy) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
-	now := time.Now()
+	// 使用策略确定需要清理的段
+	segmentsToClean := policy.ShouldCleanup(p)
+
+	// 如果没有需要清理的段，直接返回
+	if len(segmentsToClean) == 0 {
+		return nil
+	}
+
+	// 创建一个map来快速查找需要清理的段
+	segmentsToCleanMap := make(map[*Segment]struct{})
+	for _, segment := range segmentsToClean {
+		segmentsToCleanMap[segment] = struct{}{}
+	}
+
+	// 保留不需要清理的段
 	var newSegments []*Segment
-
-	// 保留活动段和未过期的段
 	for _, segment := range p.segments {
-		// 获取段的最后修改时间
-		lastModified, err := segment.getLastModifiedTime()
-		if err != nil {
-			continue
-		}
-
-		// 如果段未过期或是活动段,则保留
-		if segment == p.activeSegment || now.Sub(lastModified) <= retention {
+		// 如果段不在清理列表中，则保留
+		if _, shouldClean := segmentsToCleanMap[segment]; !shouldClean {
 			newSegments = append(newSegments, segment)
 			continue
 		}
 
-		// 关闭并删除过期段
+		// 关闭并删除需要清理的段
 		if err := segment.Close(); err != nil {
 			log.Printf("关闭段失败: %v", err)
 		}

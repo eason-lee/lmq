@@ -195,6 +195,9 @@ func (b *Broker) Start(ctx context.Context) error {
 	// 启动延迟消息处理器
 	b.StartDelayedMessageProcessor(1 * time.Second)
 	
+	// 启动段清理任务，使用默认的清理策略
+	b.StartCleanupTask(1*time.Hour, store.DefaultCleanupPolicy)
+	
 	// 启动节点同步任务
 	go b.startNodeSyncTask(ctx, 10*time.Second)
 

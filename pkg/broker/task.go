@@ -3,20 +3,22 @@ package broker
 import (
 	"log"
 	"time"
+
+	"github.com/eason-lee/lmq/pkg/store"
 )
 
 // StartCleanupTask 启动定期清理过期段的任务
-func (b *Broker) StartCleanupTask(interval time.Duration, retention time.Duration) {
+func (b *Broker) StartCleanupTask(interval time.Duration, policy store.CleanupPolicy) {
 	ticker := time.NewTicker(interval)
 	go func() {
 		for range ticker.C {
-			b.cleanupExpiredSegments(retention)
+			b.cleanupSegments(policy)
 		}
 	}()
 }
 
-// cleanupExpiredSegments 清理所有主题和分区的过期段
-func (b *Broker) cleanupExpiredSegments(retention time.Duration) {
+// cleanupSegments 使用指定的清理策略清理所有主题和分区的段
+func (b *Broker) cleanupSegments(policy store.CleanupPolicy) {
 	// 获取所有主题
 	topics := b.getTopics()
 	
@@ -25,10 +27,12 @@ func (b *Broker) cleanupExpiredSegments(retention time.Duration) {
 		partitions := b.getPartitions(topic)
 		
 		for _, partition := range partitions {
-			if err := b.store.CleanupSegments(topic, partition, retention); err != nil {
-				log.Printf("清理过期段失败: 主题=%s, 分区=%d, 错误=%v", topic, partition, err)
+			if err := b.store.CleanupSegments(topic, partition, policy); err != nil {
+				log.Printf("清理段失败: 主题=%s, 分区=%d, 策略=%s, 错误=%v", 
+					topic, partition, policy.Name(), err)
 			} else {
-				log.Printf("成功清理主题 %s 分区 %d 的过期段", topic, partition)
+				log.Printf("成功清理主题 %s 分区 %d 的段，使用策略: %s", 
+					topic, partition, policy.Name())
 			}
 		}
 	}
@@ -48,7 +52,5 @@ func (b *Broker) getTopics() []string {
 
 // getPartitions 获取主题的所有分区
 func (b *Broker) getPartitions(topic string) []int {
-	// 这里我们需要从 FileStore 中获取分区信息
-	// 由于 FileStore 没有直接提供获取分区列表的方法，我们需要添加一个
 	return b.store.GetPartitions(topic)
 }

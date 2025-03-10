@@ -8,7 +8,7 @@ import (
 
 // PartitionAssignment 分区分配信息
 type PartitionAssignment struct {
-	Topic      string   // 主题名称
+	Topic       string   // 主题名称
 	PartitionID int      // 分区ID
 	BrokerID    string   // Broker ID
 	IsLeader    bool     // 是否为主副本
@@ -77,7 +77,7 @@ func (r *RoundRobinRebalancer) Rebalance(topic string, partitionCount int, broke
 
 		// 创建分区分配
 		assignments[partID] = PartitionAssignment{
-			Topic:      topic,
+			Topic:       topic,
 			PartitionID: partID,
 			BrokerID:    replicas[0], // 第一个副本为主副本
 			IsLeader:    true,
@@ -112,14 +112,128 @@ func NewRackAwareRebalancer() *RackAwareRebalancer {
 
 // Rebalance 重新平衡分区分配
 func (r *RackAwareRebalancer) Rebalance(topic string, partitionCount int, brokers []string, replicationFactor int, currentAssignments []PartitionAssignment) ([]PartitionAssignment, error) {
-	// TODO: 实现机架感知的分区重平衡算法
-	// 1. 获取每个Broker的机架信息
-	// 2. 尽量将副本分布在不同机架上
-	// 3. 确保负载均衡
+	r.mu.Lock()
+	defer r.mu.Unlock()
 
-	// 暂时使用轮询算法
-	rr := NewRoundRobinRebalancer()
-	return rr.Rebalance(topic, partitionCount, brokers, replicationFactor, currentAssignments)
+	// 检查参数
+	if len(brokers) == 0 {
+		return nil, fmt.Errorf("没有可用的Broker")
+	}
+
+	if replicationFactor > len(brokers) {
+		return nil, fmt.Errorf("复制因子(%d)大于可用Broker数量(%d)", replicationFactor, len(brokers))
+	}
+
+	// 假设我们已经获取了每个Broker的机架信息
+	// 在实际生产环境中，这些信息应该从配置或服务发现系统获取
+	brokerRackMap := make(map[string]string)
+
+	// 模拟获取机架信息
+	// 在实际实现中，这部分应该替换为从配置或元数据服务获取真实的机架信息
+	rackCount := 3 // 假设有3个机架
+	for i, broker := range brokers {
+		rackID := fmt.Sprintf("rack-%d", i%rackCount)
+		brokerRackMap[broker] = rackID
+	}
+
+	// 按机架对Broker进行分组
+	rackBrokers := make(map[string][]string)
+	for broker, rack := range brokerRackMap {
+		rackBrokers[rack] = append(rackBrokers[rack], broker)
+	}
+
+	// 创建新的分配方案
+	assignments := make([]PartitionAssignment, partitionCount)
+
+	// 对Broker进行排序，确保结果的确定性
+	sortedBrokers := make([]string, len(brokers))
+	copy(sortedBrokers, brokers)
+	sort.Strings(sortedBrokers)
+
+	// 获取所有机架ID并排序
+	rackIDs := make([]string, 0, len(rackBrokers))
+	for rack := range rackBrokers {
+		rackIDs = append(rackIDs, rack)
+	}
+	sort.Strings(rackIDs)
+
+	// 为每个分区分配Broker
+	for partID := 0; partID < partitionCount; partID++ {
+		// 为当前分区选择副本，尽量从不同机架选择
+		replicas := make([]string, 0, replicationFactor)
+		selectedRacks := make(map[string]bool)
+
+		// 首先尝试从每个机架选择一个Broker
+		for i := 0; i < len(rackIDs) && len(replicas) < replicationFactor; i++ {
+			rackIndex := (partID + i) % len(rackIDs)
+			rack := rackIDs[rackIndex]
+
+			// 如果该机架有可用的Broker
+			if len(rackBrokers[rack]) > 0 {
+				// 选择该机架中的一个Broker
+				brokerIndex := partID % len(rackBrokers[rack])
+				replicas = append(replicas, rackBrokers[rack][brokerIndex])
+				selectedRacks[rack] = true
+			}
+		}
+
+		// 如果还需要更多副本，从所有Broker中选择，但尽量避免选择同一机架的
+		for i := 0; len(replicas) < replicationFactor && i < len(sortedBrokers); i++ {
+			broker := sortedBrokers[(partID+i)%len(sortedBrokers)]
+			rack := brokerRackMap[broker]
+
+			// 如果该机架已经选择了Broker，且还有其他机架可选，则跳过
+			if selectedRacks[rack] && len(selectedRacks) < len(rackIDs) {
+				continue
+			}
+
+			// 检查该Broker是否已经被选择
+			alreadySelected := false
+			for _, r := range replicas {
+				if r == broker {
+					alreadySelected = true
+					break
+				}
+			}
+
+			if !alreadySelected {
+				replicas = append(replicas, broker)
+				selectedRacks[rack] = true
+			}
+		}
+
+		// 如果副本数量不足，可能是因为机架数量少于复制因子
+		// 这种情况下，允许在同一机架上选择多个Broker
+		if len(replicas) < replicationFactor {
+			for i := 0; len(replicas) < replicationFactor && i < len(sortedBrokers); i++ {
+				broker := sortedBrokers[(partID+i)%len(sortedBrokers)]
+
+				// 检查该Broker是否已经被选择
+				alreadySelected := false
+				for _, r := range replicas {
+					if r == broker {
+						alreadySelected = true
+						break
+					}
+				}
+
+				if !alreadySelected {
+					replicas = append(replicas, broker)
+				}
+			}
+		}
+
+		// 创建分区分配
+		assignments[partID] = PartitionAssignment{
+			Topic:       topic,
+			PartitionID: partID,
+			BrokerID:    replicas[0], // 第一个副本为主副本
+			IsLeader:    true,
+			Replicas:    replicas,
+		}
+	}
+
+	return assignments, nil
 }
 
 // Name 返回重平衡器名称
@@ -192,7 +306,7 @@ func (m *MinimumMovementRebalancer) Rebalance(topic string, partitionCount int, 
 			}
 
 			newAssignments[i] = PartitionAssignment{
-				Topic:      topic,
+				Topic:       topic,
 				PartitionID: assignment.PartitionID,
 				BrokerID:    assignment.BrokerID,
 				IsLeader:    true,
@@ -223,7 +337,7 @@ func (m *MinimumMovementRebalancer) Rebalance(topic string, partitionCount int, 
 			}
 
 			newAssignments[i] = PartitionAssignment{
-				Topic:      topic,
+				Topic:       topic,
 				PartitionID: assignment.PartitionID,
 				BrokerID:    replicas[0],
 				IsLeader:    true,

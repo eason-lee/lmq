@@ -5,7 +5,6 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
-	"time"
 
 	"github.com/eason-lee/lmq/pkg/protocol"
 	pb "github.com/eason-lee/lmq/proto"
@@ -227,18 +226,7 @@ func (fs *FileStore) CreatePartition(topic string, partID int) error {
 	return nil
 }
 
-// CleanupSegments 清理过期的段
-func (fs *FileStore) CleanupSegments(topic string, partition int, retention time.Duration) error {
-	fs.mu.RLock()
-	p, ok := fs.partitions[topic][partition]
-	fs.mu.RUnlock()
 
-	if !ok {
-		return fmt.Errorf("分区不存在: %s-%d", topic, partition)
-	}
-
-	return p.CleanupSegments(retention)
-}
 
 // GetMessages 获取指定主题和分区的所有消息
 func (fs *FileStore) GetMessages(topic string) ([]*protocol.Message, error) {
@@ -301,4 +289,25 @@ func (fs *FileStore) GetLatestOffset(topic string, partition int) (int64, error)
 	}
 
 	return p.GetLatestOffset()
+}
+
+func (fs *FileStore) mustGetPartition(topic string, partition int) (*Partition, error) {
+	fs.mu.RLock()
+	p, ok := fs.partitions[topic][partition]
+	fs.mu.RUnlock()
+	if!ok {
+		return nil, fmt.Errorf("分区不存在: %s-%d", topic, partition)
+	}
+	return p, nil
+}
+
+// CleanupSegments 使用指定的清理策略清理段
+func (fs *FileStore) CleanupSegments(topic string, partitionID int, policy CleanupPolicy) error {
+	p, err := fs.mustGetPartition(topic, partitionID)
+	if err!= nil {
+		return err
+	}
+
+	// 应用清理策略
+	return p.ApplyCleanupPolicy(policy)
 }

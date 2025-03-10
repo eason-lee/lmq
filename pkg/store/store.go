@@ -1,7 +1,6 @@
 package store
 
 import (
-	"time"
 
 	"github.com/eason-lee/lmq/pkg/protocol"
 )
@@ -17,5 +16,5 @@ type Store interface {
 	GetMessages(topic string) ([]*protocol.Message, error)
 	GetTopics() []string
 	GetPartitions(topic string) []int
-	CleanupSegments(topic string, partition int, retention time.Duration) error 
+	CleanupSegments(topic string, partition int, policy CleanupPolicy) error
 }

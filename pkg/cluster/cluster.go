@@ -41,20 +41,27 @@ type ClusterManager struct {
 	stopCh      chan struct{}              // 停止信号
 
 	// 存储和协调器
-	store       *store.FileStore        // 存储引擎
-	coordinator coordinator.Coordinator // 协调器
+	store           *store.FileStore              // 存储引擎
+	coordinator     coordinator.Coordinator       // 协调器
+	partitionMgr    *coordinator.PartitionManager // 分区管理器
+	replicationFactor int                         // 复制因子
 }
 
 // NewClusterManager 创建一个新的集群管理器
-func NewClusterManager(nodeID string, localAddr string, store *store.FileStore, coord coordinator.Coordinator) *ClusterManager {
+func NewClusterManager(nodeID string, localAddr string, storeFile *store.FileStore, coord coordinator.Coordinator) *ClusterManager {
+	// 创建分区管理器，使用默认的最小移动重平衡器
+	partitionMgr := coordinator.NewPartitionManager(coord, store.DefaultRebalancer)
+	
 	return &ClusterManager{
 		localNodeID: nodeID,
 		localAddr:   localAddr,
 		nodes:       make(map[string]*Node),
 		clients:     make(map[string]*network.Client),
 		stopCh:      make(chan struct{}),
-		store:       store,
+		store:       storeFile,
 		coordinator: coord,
+		partitionMgr: partitionMgr,
+		replicationFactor: 1, // 默认复制因子为1
 	}
 }
 
@@ -719,8 +726,11 @@ func (cm *ClusterManager) replicateToNode(ctx context.Context, nodeID string, to
 // SyncNodes 从外部同步节点信息
 func (cm *ClusterManager) SyncNodes(nodes map[string]string) {
 	cm.mu.Lock()
-	defer cm.mu.Unlock()
-
+	
+	// 记录节点变化情况
+	nodeAdded := false
+	nodeRemoved := false
+	
 	// 更新现有节点
 	for nodeID, addr := range nodes {
 		if nodeID == cm.localNodeID {
@@ -740,6 +750,7 @@ func (cm *ClusterManager) SyncNodes(nodes map[string]string) {
 				LastSeen: time.Now(),
 			}
 			log.Printf("添加新节点: %s (%s)", nodeID, addr)
+			nodeAdded = true
 		}
 	}
 
@@ -759,6 +770,28 @@ func (cm *ClusterManager) SyncNodes(nodes map[string]string) {
 			}
 
 			log.Printf("移除节点: %s", nodeID)
+			nodeRemoved = true
+		}
+	}
+	cm.mu.Unlock()
+	
+	// 如果节点数量发生变化，触发分区重平衡
+	if nodeAdded || nodeRemoved {
+		log.Printf("集群节点发生变化，触发分区重平衡")
+		ctx := context.Background()
+		
+		// 如果有新节点加入
+		if nodeAdded {
+			if err := cm.partitionMgr.AddBrokerAndRebalance(ctx, "", cm.replicationFactor); err != nil {
+				log.Printf("添加节点后重平衡分区失败: %v", err)
+			}
+		}
+		
+		// 如果有节点移除
+		if nodeRemoved {
+			if err := cm.partitionMgr.RemoveBrokerAndRebalance(ctx, "", cm.replicationFactor); err != nil {
+				log.Printf("移除节点后重平衡分区失败: %v", err)
+			}
 		}
 	}
 }

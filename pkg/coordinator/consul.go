@@ -341,7 +341,7 @@ func (c *ConsulCoordinator) Close() error {
 }
 
 // CreatePartition 创建分区
-func (c *ConsulCoordinator) CreatePartition(partition *PartitionInfo) error {
+func (c *ConsulCoordinator) CreatePartition(ctx context.Context, partition *PartitionInfo) error {
 	data, err := json.Marshal(partition)
 	if err != nil {
 		return fmt.Errorf("序列化分区信息失败: %w", err)
@@ -431,7 +431,7 @@ func (c *ConsulCoordinator) GetPartitionReplicas(ctx context.Context, topic stri
 }
 
 // UpdatePartition 更新分区信息
-func (c *ConsulCoordinator) UpdatePartition(partition *PartitionInfo) error {
+func (c *ConsulCoordinator) UpdatePartition(ctx context.Context, partition *PartitionInfo) error {
 	key := fmt.Sprintf("topics/%s/partitions/%d", partition.Topic, partition.ID)
 	value, err := json.Marshal(partition)
 	if err != nil {
@@ -632,7 +632,7 @@ func (c *ConsulCoordinator) ElectPartitionLeader(ctx context.Context, topic stri
 
 		// 更新分区leader
 		partition.Leader = nodeID
-		if err := c.UpdatePartition(partition); err != nil {
+		if err := c.UpdatePartition(ctx, partition); err != nil {
 			// 如果更新失败，释放锁
 			c.client.KV().Release(&api.KVPair{
 				Key:     key,
@@ -1037,7 +1037,7 @@ func (c *ConsulCoordinator) AddToISR(ctx context.Context, topic string, partitio
 	partition.ISR = append(partition.ISR, nodeID)
 
 	// 更新分区信息
-	return c.UpdatePartition(partition)
+	return c.UpdatePartition(ctx, partition)
 }
 
 // RemoveFromISR 从 ISR 列表中移除节点
@@ -1057,7 +1057,7 @@ func (c *ConsulCoordinator) RemoveFromISR(ctx context.Context, topic string, par
 	partition.ISR = newISR
 
 	// 更新分区信息
-	return c.UpdatePartition(partition)
+	return c.UpdatePartition(ctx, partition)
 }
 
 // GetISR 获取 ISR 列表
@@ -1139,5 +1139,5 @@ func (c *ConsulCoordinator) UpdateISR(ctx context.Context, topic string, partiti
 	}
 
 	partition.ISR = isr
-	return c.UpdatePartition(partition)
+	return c.UpdatePartition(ctx, partition)
 }

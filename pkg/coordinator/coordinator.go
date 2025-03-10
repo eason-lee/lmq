@@ -51,6 +51,8 @@ type Coordinator interface {
 	WatchTopics(ctx context.Context) (<-chan []string, error)
 
 	// 分区管理
+	CreatePartition(ctx context.Context, partition *PartitionInfo) error 
+	UpdatePartition(ctx context.Context, partition *PartitionInfo) error 
 	GetPartition(ctx context.Context, topic string, partitionID int) (*PartitionInfo, error)
 	GetPartitions(ctx context.Context, topic string) ([]*PartitionInfo, error)
 	GetNodePartitions(ctx context.Context, nodeID string) ([]*PartitionInfo, error)

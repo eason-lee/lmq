@@ -276,9 +276,18 @@ func (b *Broker) HandleSubscribe(ctx context.Context, req *pb.SubscribeRequest) 
 		if !exists {
 			// 主题不存在，自动创建
 			log.Printf("主题 %s 不存在，自动创建", topic)
-			if err := b.coordinator.CreateTopic(ctx, topic, b.config.DefaultPartitions); err != nil { // 默认创建1个分区
+			
+			// 创建主题元数据
+			if err := b.coordinator.CreateTopic(ctx, topic, b.config.DefaultPartitions); err != nil {
 				return fmt.Errorf("自动创建主题失败: %w", err)
 			}
+			
+			// 使用分区管理器创建分区并应用重平衡策略
+			partitionManager := coordinator.NewPartitionManager(b.coordinator, store.DefaultRebalancer)
+			if err := partitionManager.CreateTopicPartitions(ctx, topic, b.config.DefaultPartitions, 1); err != nil { // 默认复制因子为1
+				return fmt.Errorf("创建主题分区失败: %w", err)
+			}
+			log.Printf("已为主题 %s 创建 %d 个分区，使用 %s 重平衡策略", topic, b.config.DefaultPartitions, store.DefaultRebalancer.Name())
 		}
 	}
 

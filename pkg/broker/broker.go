@@ -247,6 +247,76 @@ func (b *Broker) HandlePublish(ctx context.Context, req *pb.PublishRequest) erro
 		return fmt.Errorf("写入消息失败: %w", err)
 	}
 
+	// 检查当前节点是否是分区的leader
+	isLeader := partition.Leader == b.nodeID
+
+	// 如果当前节点是leader，则复制消息到follower节点
+	if isLeader {
+		// 获取分区的follower节点
+		followers := partition.Followers
+		if len(followers) > 0 {
+			// 并行复制到所有follower
+			var wg sync.WaitGroup
+			errors := make(chan error, len(followers))
+
+			for _, followerID := range followers {
+				wg.Add(1)
+				go func(nodeID string) {
+					defer wg.Done()
+
+					// 获取follower节点的客户端
+					client, err := b.clusterMgr.GetOrCreateClient(nodeID)
+					if err != nil {
+						errors <- fmt.Errorf("获取节点 %s 的客户端失败: %w", nodeID, err)
+						return
+					}
+
+					// 构建复制请求
+					replicationReq := &pb.Request{
+						Type: "replication",
+						RequestData: &pb.Request_PublishData{
+							PublishData: &pb.PublishRequest{
+								Topic:      req.Topic,
+								Body:       msg.Body,
+								Type:       msg.Type,
+								Attributes: msg.Attributes,
+							},
+						},
+					}
+
+					// 发送复制请求
+					resp, err := client.Send("replication", replicationReq)
+					if err != nil {
+						errors <- fmt.Errorf("向节点 %s 发送复制请求失败: %w", nodeID, err)
+						return
+					}
+
+					if resp.Status != pb.Status_OK {
+						errors <- fmt.Errorf("节点 %s 复制失败: %s", nodeID, resp.Message)
+					}
+				}(followerID)
+			}
+
+			// 等待所有复制完成
+			wg.Wait()
+			close(errors)
+
+			// 收集错误
+			var errs []error
+			for err := range errors {
+				errs = append(errs, err)
+				log.Printf("复制消息错误: %v", err)
+			}
+
+			// 如果所有复制都失败，记录错误但不影响主流程
+			if len(errs) > 0 && len(errs) == len(followers) {
+				log.Printf("警告: 所有节点复制失败: %v", errs[0])
+			} else if len(errs) > 0 {
+				log.Printf("警告: 部分节点复制失败: %d/%d", len(errs), len(followers))
+			}
+		}
+	}
+
 	return nil
 }
 

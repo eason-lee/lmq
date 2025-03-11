@@ -241,8 +241,8 @@ func (cm *ClusterManager) handleReplicationRequest(req *pb.Request) *pb.Response
 	}
 }
 
-// getClient 获取或创建客户端连接
-func (cm *ClusterManager) getClient(nodeID string) (*network.Client, error) {
+// GetOrCreateClient 获取或创建客户端连接
+func (cm *ClusterManager) GetOrCreateClient(nodeID string) (*network.Client, error) {
 	cm.mu.RLock()
 	client, exists := cm.clients[nodeID]
 	node, nodeExists := cm.nodes[nodeID]
@@ -359,7 +359,7 @@ func (cm *ClusterManager) sendHeartbeats() {
 				},
 			}
 
-			client, err := cm.getClient(n.ID)
+			client, err := cm.GetOrCreateClient(n.ID)
 			if err != nil {
 				log.Printf("获取节点 %s 的客户端连接失败: %v", n.ID, err)
 				return
@@ -589,114 +589,6 @@ func equalStringSlices(a, b []string) bool {
 	}
 
 	return true
-}
-
-// ReplicateMessages 复制消息到其他节点
-// TODO 没有被使用
-func (cm *ClusterManager) ReplicateMessages(ctx context.Context, topic string, partition int, messages []*pb.Message) error {
-	// 检查当前节点是否是 leader
-	isLeader, err := cm.coordinator.IsPartitionLeader(ctx, topic, partition, cm.localNodeID)
-	if err != nil {
-		return fmt.Errorf("检查 leader 状态失败: %w", err)
-	}
-
-	if !isLeader {
-		return fmt.Errorf("当前节点不是分区 %s-%d 的 leader", topic, partition)
-	}
-
-	// 获取分区信息
-	partitionInfo, err := cm.coordinator.GetPartition(ctx, topic, partition)
-	if err != nil {
-		return fmt.Errorf("获取分区信息失败: %w", err)
-	}
-
-	if partitionInfo == nil {
-		return fmt.Errorf("分区 %s-%d 不存在", topic, partition)
-	}
-
-	// 保存消息到本地
-	if err := cm.store.Write(topic, partition, messages); err != nil {
-		return fmt.Errorf("保存消息到本地失败: %w", err)
-	}
-
-	// 获取最新偏移量
-	offset := int64(0) // 这里需要实现获取最新消息ID的方法
-
-	// 更新自己的复制状态
-	if err := cm.coordinator.RegisterReplicaStatus(ctx, topic, partition, cm.localNodeID, offset); err != nil {
-		log.Printf("注册副本状态失败: %v", err)
-	}
-
-	// 并行复制到所有 follower
-	var wg sync.WaitGroup
-	errors := make(chan error, len(partitionInfo.Followers))
-
-	for _, followerID := range partitionInfo.Followers {
-		wg.Add(1)
-		go func(nodeID string) {
-			defer wg.Done()
-
-			err := cm.replicateToNode(ctx, nodeID, topic, partition, messages)
-			if err != nil {
-				errors <- fmt.Errorf("复制到节点 %s 失败: %w", nodeID, err)
-			}
-		}(followerID)
-	}
-
-	// 等待所有复制完成
-	wg.Wait()
-	close(errors)
-
-	// 收集错误
-	var errs []error
-	for err := range errors {
-		errs = append(errs, err)
-	}
-
-	// 如果有错误，但至少有一个复制成功，返回 nil
-	if len(errs) > 0 && len(errs) < len(partitionInfo.Followers) {
-		log.Printf("部分节点复制失败: %v", errs)
-		return nil
-	}
-
-	// 如果所有复制都失败，返回错误
-	if len(errs) > 0 && len(errs) == len(partitionInfo.Followers) {
-		return fmt.Errorf("所有节点复制失败: %v", errs[0])
-	}
-
-	return nil
-}
-
-// replicateToNode 复制消息到指定节点
-func (cm *ClusterManager) replicateToNode(ctx context.Context, nodeID string, topic string, partition int, messages []*pb.Message) error {
-	client, err := cm.getClient(nodeID)
-	if err != nil {
-		return err
-	}
-
-	// 构建复制请求
-	replicationReq := &pb.Request{
-		Type: "replication",
-		RequestData: &pb.Request_PublishData{
-			PublishData: &pb.PublishRequest{
-				Topic: topic,
-				Body:  messages[0].Body, // TODO 不应该是第一个消息内容
-				Type:  pb.MessageType_NORMAL,
-			},
-		},
-	}
-
-	// 发送复制请求
-	resp, err := client.Send("replication", replicationReq)
-	if err != nil {
-		return err
-	}
-
-	if resp.Status != pb.Status_OK {
-		return fmt.Errorf("复制失败: %s", resp.Message)
-	}
-
-	return nil
 }
 
 // SyncNodes 从外部同步节点信息

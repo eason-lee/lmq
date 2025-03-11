@@ -16,7 +16,6 @@ import (
 	"github.com/eason-lee/lmq/pkg/cluster"
 	"github.com/eason-lee/lmq/pkg/coordinator"
 	"github.com/eason-lee/lmq/pkg/network"
-	"github.com/eason-lee/lmq/pkg/protocol"
 	"github.com/eason-lee/lmq/pkg/store"
 	pb "github.com/eason-lee/lmq/proto"
 	"github.com/google/uuid"
@@ -31,7 +30,7 @@ type Subscriber struct {
 	Filters   map[string]string
 	BatchSize int32
 	Timeout   time.Duration
-	Ch        chan *protocol.Message
+	Ch        chan *pb.Message
 }
 
 // Broker 消息代理，负责消息的路由和分发
@@ -40,7 +39,7 @@ type Broker struct {
 	store           store.Store
 	subscribers     map[string][]*Subscriber // 主题 -> 订阅者列表
 	mu              sync.RWMutex
-	unackedMessages map[string]*protocol.Message // 消息ID -> 消息
+	unackedMessages map[string]*pb.Message // 消息ID -> 消息
 	unackedMu       sync.RWMutex
 	clusterMgr      *cluster.ClusterManager // 集群管理器
 	coordinator     coordinator.Coordinator // 协调器
@@ -52,29 +51,28 @@ type Broker struct {
 
 // BrokerConfig 代理配置
 type BrokerConfig struct {
-	addr string
+	addr              string
 	DefaultPartitions int // 默认分区数量
 }
 
-
 // DelayedMessageQueue 延迟消息队列
 type DelayedMessageQueue struct {
-	messages map[string]*protocol.Message // 消息ID -> 消息
+	messages map[string]*pb.Message // 消息ID -> 消息
 	mu       sync.RWMutex
 }
 
 // NewDelayedMessageQueue 创建新的延迟消息队列
 func NewDelayedMessageQueue() *DelayedMessageQueue {
 	return &DelayedMessageQueue{
-		messages: make(map[string]*protocol.Message),
+		messages: make(map[string]*pb.Message),
 	}
 }
 
 // Add 添加延迟消息
-func (q *DelayedMessageQueue) Add(msg *protocol.Message) {
+func (q *DelayedMessageQueue) Add(msg *pb.Message) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
-	q.messages[msg.Message.Id] = msg
+	q.messages[msg.Id] = msg
 }
 
 // Remove 移除延迟消息
@@ -85,13 +83,13 @@ func (q *DelayedMessageQueue) Remove(msgID string) {
 }
 
 // GetReadyMessages 获取准备投递的消息
-func (q *DelayedMessageQueue) GetReadyMessages() []*protocol.Message {
+func (q *DelayedMessageQueue) GetReadyMessages() []*pb.Message {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 
-	var readyMsgs []*protocol.Message
+	var readyMsgs []*pb.Message
 	for id, msg := range q.messages {
-		if msg.ShouldDeliver() {
+		if shouldDeliver(msg) {
 			readyMsgs = append(readyMsgs, msg)
 			delete(q.messages, id)
 		}
@@ -142,7 +140,7 @@ func NewBroker(config *BrokerConfig) (*Broker, error) {
 	if config == nil {
 		config = &BrokerConfig{
 			DefaultPartitions: 3, // 默认3个分区
-			addr: "0.0.0.0:9000",
+			addr:              "0.0.0.0:9000",
 		}
 	}
 
@@ -163,11 +161,11 @@ func NewBroker(config *BrokerConfig) (*Broker, error) {
 		nodeID:          nodeID,
 		store:           fileStore,
 		subscribers:     make(map[string][]*Subscriber),
-		unackedMessages: make(map[string]*protocol.Message),
+		unackedMessages: make(map[string]*pb.Message),
 		coordinator:     consulCoord,
 		stopCh:          make(chan struct{}),
 		delayedMsgs:     NewDelayedMessageQueue(),
-		config: config,
+		config:          config,
 	}
 
 	server, err := network.NewServer(config.addr, broker)
@@ -194,10 +192,10 @@ func (b *Broker) Start(ctx context.Context) error {
 
 	// 启动延迟消息处理器
 	b.StartDelayedMessageProcessor(1 * time.Second)
-	
+
 	// 启动段清理任务，使用默认的清理策略
 	b.StartCleanupTask(1*time.Hour, store.DefaultCleanupPolicy)
-	
+
 	// 启动节点同步任务
 	go b.startNodeSyncTask(ctx, 10*time.Second)
 
@@ -220,18 +218,16 @@ func (b *Broker) HandlePublish(ctx context.Context, req *pb.PublishRequest) erro
 		return err
 	}
 
-	msg := &protocol.Message{
-		Message: &pb.Message{
-			Id:         uuid.New().String(),
-			Topic:      req.Topic,
-			Body:       req.Body,
-			Type:       req.Type,
-			Attributes: req.Attributes,
-			Timestamp:  timestamppb.New(time.Now()),
-		},
+	msg := &pb.Message{
+		Id:         uuid.New().String(),
+		Topic:      req.Topic,
+		Body:       req.Body,
+		Type:       req.Type,
+		Attributes: req.Attributes,
+		Timestamp:  timestamppb.New(time.Now()),
 	}
 
-	partitionID, err := b.SelectPartition(ctx, req.Topic, msg.Message.Id)
+	partitionID, err := b.SelectPartition(ctx, req.Topic, msg.Id)
 	if err != nil {
 		return fmt.Errorf("选择分区失败: %w", err)
 	}
@@ -247,7 +243,7 @@ func (b *Broker) HandlePublish(ctx context.Context, req *pb.PublishRequest) erro
 	}
 
 	// 写入消息
-	if err := b.store.Write(req.Topic, partitionID, []*protocol.Message{msg}); err != nil {
+	if err := b.store.Write(req.Topic, partitionID, []*pb.Message{msg}); err != nil {
 		return fmt.Errorf("写入消息失败: %w", err)
 	}
 
@@ -276,12 +272,12 @@ func (b *Broker) HandleSubscribe(ctx context.Context, req *pb.SubscribeRequest) 
 		if !exists {
 			// 主题不存在，自动创建
 			log.Printf("主题 %s 不存在，自动创建", topic)
-			
+
 			// 创建主题元数据
 			if err := b.coordinator.CreateTopic(ctx, topic, b.config.DefaultPartitions); err != nil {
 				return fmt.Errorf("自动创建主题失败: %w", err)
 			}
-			
+
 			// 使用分区管理器创建分区并应用重平衡策略
 			partitionManager := coordinator.NewPartitionManager(b.coordinator, store.DefaultRebalancer)
 			if err := partitionManager.CreateTopicPartitions(ctx, topic, b.config.DefaultPartitions, 1); err != nil { // 默认复制因子为1
@@ -294,6 +290,53 @@ func (b *Broker) HandleSubscribe(ctx context.Context, req *pb.SubscribeRequest) 
 	// 注册消费者组
 	if err := b.coordinator.RegisterConsumer(ctx, req.GroupId, req.Topics); err != nil {
 		return fmt.Errorf("注册消费者组失败: %w", err)
+	}
+
+	// 为消费者组分配分区
+	if err := b.assignPartitionsToConsumerGroup(ctx, req.GroupId, req.Topics); err != nil {
+		return fmt.Errorf("分配分区失败: %w", err)
+	}
+
+	return nil
+}
+
+// assignPartitionsToConsumerGroup 为消费者组分配分区
+func (b *Broker) assignPartitionsToConsumerGroup(ctx context.Context, groupID string, topics []string) error {
+	// 获取消费者组中的所有消费者
+	consumers, err := b.coordinator.GetConsumersInGroup(ctx, groupID)
+	if err != nil {
+		return fmt.Errorf("获取消费者组成员失败: %w", err)
+	}
+
+	// 如果没有消费者，不需要分配
+	if len(consumers) == 0 {
+		return nil
+	}
+
+	// 为每个主题分配分区
+	for _, topic := range topics {
+		// 获取主题的所有分区
+		partitions, err := b.coordinator.GetTopicPartitions(ctx, topic)
+		if err != nil {
+			return fmt.Errorf("获取主题分区失败: %w", err)
+		}
+
+		// 使用轮询策略分配分区给消费者
+		// 这里可以实现更复杂的分配策略，如粘性分配、范围分配等
+		for i, partition := range partitions {
+			consumerIndex := i % len(consumers)
+			consumerID := consumers[consumerIndex]
+
+			// 将分区分配给消费者
+			if err := b.coordinator.AssignPartitionToConsumer(ctx, topic, partition.ID, groupID, consumerID); err != nil {
+				return fmt.Errorf("分配分区失败: %w", err)
+			}
+		}
+	}
+
+	// 触发消费者组再平衡事件
+	if err := b.coordinator.TriggerGroupRebalance(ctx, groupID); err != nil {
+		return fmt.Errorf("触发消费者组再平衡失败: %w", err)
 	}
 
 	return nil
@@ -316,36 +359,37 @@ func (b *Broker) HandlePull(ctx context.Context, req *pb.PullRequest) (*pb.Respo
 		return nil, err
 	}
 
-	// 获取消费者组的消费位置
-	offset, err := b.coordinator.GetConsumerOffset(ctx, req.GroupId, req.Topic)
-	if err != nil {
-		return nil, fmt.Errorf("获取消费位置失败: %w", err)
-	}
-
 	// 获取消费者组的分区
-	partition, err := b.coordinator.GetConsumerPartition(ctx, req.GroupId, req.Topic)
+	partitions, err := b.coordinator.GetConsumerAssignedPartitions(ctx, req.GroupId, req.ConsumerId, req.Topic)
 	if err != nil {
-		return nil, fmt.Errorf("获取分区失败: %w", err)
+		return nil, fmt.Errorf("获取分配的分区失败: %w", err)
 	}
 
-	// 读取消息
-	messages, err := b.store.Read(req.Topic, partition, offset, int(req.MaxMessages))
-	if err != nil {
-		return nil, fmt.Errorf("读取消息失败: %w", err)
-	}
-
-	// 如果没有消息，返回空响应
-	if len(messages) == 0 {
+	// 如果没有分配分区，返回空响应
+	if len(partitions) == 0 {
 		return &pb.Response{
 			Status:  pb.Status_OK,
-			Message: "没有新消息",
+			Message: "没有分配的分区",
 		}, nil
 	}
 
-	// 转换消息格式
-	pbMessages := make([]*pb.Message, len(messages))
-	for i, msg := range messages {
-		pbMessages[i] = msg.Message
+	var allMessages []*pb.Message
+
+	// 从每个分配的分区读取消息
+	for _, partition := range partitions {
+		// 获取该分区的消费位置
+		offset, err := b.coordinator.GetConsumerOffset(ctx, req.GroupId, req.Topic, partition)
+		if err != nil {
+			return nil, fmt.Errorf("获取消费位置失败: %w", err)
+		}
+
+		// 读取消息
+		messages, err := b.store.Read(req.Topic, partition, offset, int(req.MaxMessages)/len(partitions))
+		if err != nil {
+			return nil, fmt.Errorf("读取消息失败: %w", err)
+		}
+
+		allMessages = append(allMessages, messages...)
 	}
 
 	// 构造响应
@@ -354,7 +398,7 @@ func (b *Broker) HandlePull(ctx context.Context, req *pb.PullRequest) (*pb.Respo
 		Message: "拉取消息成功",
 		ResponseData: &pb.Response_BatchMessagesData{
 			BatchMessagesData: &pb.BatchMessagesResponse{
-				Messages: pbMessages,
+				Messages: allMessages,
 			},
 		},
 	}, nil
@@ -424,8 +468,8 @@ func (b *Broker) StartDelayedMessageProcessor(interval time.Duration) {
 				readyMsgs := b.delayedMsgs.GetReadyMessages()
 				for _, msg := range readyMsgs {
 					req := &pb.PublishRequest{
-						Topic: msg.Message.Topic,
-						Body:  msg.Message.Body,
+						Topic: msg.Topic,
+						Body:  msg.Body,
 						Type:  pb.MessageType_NORMAL,
 					}
 					if err := b.HandlePublish(context.Background(), req); err != nil {
@@ -500,4 +544,25 @@ func (b *Broker) SelectPartition(ctx context.Context, topic string, messageID st
 	}
 
 	return (hash & 0x7FFFFFFF) % partitionCount, nil
+}
+
+// shouldDeliver 检查延迟消息是否应该投递
+func shouldDeliver(msg *pb.Message) bool {
+	if msg.Type != pb.MessageType_DELAYED {
+		return true
+	}
+
+	// 获取延迟时间
+	delayAttr, exists := msg.Attributes["delay"]
+	if !exists {
+		return true
+	}
+
+	var pubReq pb.PublishRequest
+	if err := delayAttr.UnmarshalTo(&pubReq); err != nil {
+		return true
+	}
+
+	deliveryTime := msg.Timestamp.AsTime().Add(time.Duration(pubReq.DelaySeconds) * time.Second)
+	return time.Now().After(deliveryTime)
 }

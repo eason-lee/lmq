@@ -6,7 +6,6 @@ import (
 	"path/filepath"
 	"sync"
 
-	"github.com/eason-lee/lmq/pkg/protocol"
 	pb "github.com/eason-lee/lmq/proto"
 )
 
@@ -108,7 +107,7 @@ func (fs *FileStore) loadPartition(topic string, partitionID int) error {
 }
 
 // Write 写入消息到指定分区
-func (fs *FileStore) Write(topic string, partition int, messages []*protocol.Message) error {
+func (fs *FileStore) Write(topic string, partition int, messages []*pb.Message) error {
 	fs.mu.RLock()
 	p, ok := fs.partitions[topic][partition]
 	fs.mu.RUnlock()
@@ -124,17 +123,11 @@ func (fs *FileStore) Write(topic string, partition int, messages []*protocol.Mes
 		fs.mu.RUnlock()
 	}
 
-	// 转换消息格式
-	pbMessages := make([]*pb.Message, len(messages))
-	for i, msg := range messages {
-		pbMessages[i] = msg.Message
-	}
-
-	return p.Write(pbMessages)
+	return p.Write(messages)
 }
 
 // Read 从指定分区读取消息
-func (fs *FileStore) Read(topic string, partition int, offset int64, maxMessages int) ([]*protocol.Message, error) {
+func (fs *FileStore) Read(topic string, partition int, offset int64, maxMessages int) ([]*pb.Message, error) {
 	fs.mu.RLock()
 	p, ok := fs.partitions[topic][partition]
 	fs.mu.RUnlock()
@@ -143,20 +136,7 @@ func (fs *FileStore) Read(topic string, partition int, offset int64, maxMessages
 		return nil, fmt.Errorf("分区不存在: %s-%d", topic, partition)
 	}
 
-	pbMessages, err := p.Read(offset, maxMessages)
-	if err != nil {
-		return nil, err
-	}
-
-	// 转换消息格式
-	messages := make([]*protocol.Message, len(pbMessages))
-	for i, pbMsg := range pbMessages {
-		messages[i] = &protocol.Message{
-			Message: pbMsg,
-		}
-	}
-
-	return messages, nil
+	return p.Read(offset, maxMessages)
 }
 
 // GetOffset 获取指定消息的偏移量
@@ -229,7 +209,7 @@ func (fs *FileStore) CreatePartition(topic string, partID int) error {
 
 
 // GetMessages 获取指定主题和分区的所有消息
-func (fs *FileStore) GetMessages(topic string) ([]*protocol.Message, error) {
+func (fs *FileStore) GetMessages(topic string) ([]*pb.Message, error) {
 	fs.mu.RLock()
 	partitions, ok := fs.partitions[topic]
 	fs.mu.RUnlock()
@@ -238,7 +218,7 @@ func (fs *FileStore) GetMessages(topic string) ([]*protocol.Message, error) {
 		return nil, nil // 主题不存在，返回空列表
 	}
 
-	var allMessages []*protocol.Message
+	var allMessages []*pb.Message
 	for partID := range partitions {
 		messages, err := fs.Read(topic, partID, 0, 1000) // 读取最多1000条消息
 		if err != nil {

@@ -5,7 +5,7 @@ import (
 	"log"
 	"time"
 
-	"github.com/eason-lee/lmq/pkg/protocol"
+	pb "github.com/eason-lee/lmq/proto"
 	"github.com/eason-lee/lmq/sdk"
 )
 
@@ -29,7 +29,7 @@ func main() {
 	defer client.Close()
 
 	// 订阅主题
-	err = client.Subscribe([]string{"test-topic"}, func(messages []*protocol.Message) {
+	err = client.Subscribe([]string{"test-topic"}, func(messages []*pb.Message) {
 		for _, msg := range messages {
 			fmt.Printf("收到消息: ID=%s, 主题=%s, 内容=%s, 时间=%v\n",
 				msg.Id, msg.Topic, string(msg.Body), msg.Timestamp)

@@ -51,8 +51,8 @@ type Coordinator interface {
 	WatchTopics(ctx context.Context) (<-chan []string, error)
 
 	// 分区管理
-	CreatePartition(ctx context.Context, partition *PartitionInfo) error 
-	UpdatePartition(ctx context.Context, partition *PartitionInfo) error 
+	CreatePartition(ctx context.Context, partition *PartitionInfo) error
+	UpdatePartition(ctx context.Context, partition *PartitionInfo) error
 	GetPartition(ctx context.Context, topic string, partitionID int) (*PartitionInfo, error)
 	GetPartitions(ctx context.Context, topic string) ([]*PartitionInfo, error)
 	GetNodePartitions(ctx context.Context, nodeID string) ([]*PartitionInfo, error)
@@ -68,8 +68,13 @@ type Coordinator interface {
 	UnregisterConsumer(ctx context.Context, groupID string) error
 	GetConsumerGroup(ctx context.Context, groupID string) (*ConsumerGroupInfo, error)
 	CommitOffset(ctx context.Context, groupID string, topic string, offset int64) error
-	GetConsumerOffset(ctx context.Context, groupID string, topic string) (int64, error)
+	GetConsumerOffset(ctx context.Context, groupID string, topic string, partition int) (int64, error)
 	GetConsumerPartition(ctx context.Context, groupID string, topic string) (int, error)
+	GetConsumersInGroup(ctx context.Context, groupID string) ([]string, error)
+	GetTopicPartitions(ctx context.Context, topic string) ([]*PartitionInfo, error)
+	AssignPartitionToConsumer(ctx context.Context, topic string, partitionID int, groupID string, consumerID string) error
+	TriggerGroupRebalance(ctx context.Context, groupID string) error
+	GetConsumerAssignedPartitions(ctx context.Context, groupID string, consumerID string, topic string) ([]int, error)
 
 	// 副本状态管理
 	RegisterReplicaStatus(ctx context.Context, topic string, partitionID int, nodeID string, offset int64) error

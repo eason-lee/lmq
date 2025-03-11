@@ -7,9 +7,10 @@ import (
 	"time"
 
 	"github.com/eason-lee/lmq/pkg/network"
-	"github.com/eason-lee/lmq/pkg/protocol"
 	pb "github.com/eason-lee/lmq/proto"
+	"github.com/google/uuid"
 	"google.golang.org/protobuf/types/known/anypb"
+	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
 // ProducerConfig 生产者配置
@@ -55,6 +56,19 @@ func NewProducer(config *ProducerConfig) (*Producer, error) {
 	}, nil
 }
 
+func (p *Producer)newMessage(topic string, body []byte) *pb.Message {
+	now := timestamppb.Now()
+	return &pb.Message{
+		Id:         uuid.New().String(),
+		Topic:      topic,
+		Body:       body,
+		Timestamp:  now,
+		Type:       pb.MessageType_NORMAL,
+		Version:    1,
+		Attributes: make(map[string]*anypb.Any),
+	}
+}
+
 // Send 同步发送消息到指定主题
 func (p *Producer) Send(topic string, data []byte, partitionKey string) (*SendResult, error) {
 	// 选择一个可用的 broker
@@ -67,11 +81,11 @@ func (p *Producer) Send(topic string, data []byte, partitionKey string) (*SendRe
 	}
 
 	// 创建消息
-	msg := protocol.NewMessage(topic, data)
+	msg := p.newMessage(topic, data)
 
 	// 如果提供了分区键，设置到消息中
 	if partitionKey != "" {
-		msg.Message.Attributes["partition_key"] = mustPackAny(partitionKey)
+		msg.Attributes["partition_key"] = mustPackAny(partitionKey)
 	}
 
 	// 发送消息
@@ -89,10 +103,10 @@ func (p *Producer) Send(topic string, data []byte, partitionKey string) (*SendRe
 			}
 
 			return &SendResult{
-				MessageID: msg.Message.Id,
+				MessageID: msg.Id,
 				Topic:     topic,
 				Partition: partition,
-				Timestamp: msg.Message.Timestamp.AsTime(),
+				Timestamp: msg.Timestamp.AsTime(),
 				Error:     nil,
 			}, nil
 		}
@@ -101,7 +115,7 @@ func (p *Producer) Send(topic string, data []byte, partitionKey string) (*SendRe
 	}
 
 	return &SendResult{
-		MessageID: msg.Message.Id,
+		MessageID: msg.Id,
 		Topic:     topic,
 		Error:     fmt.Errorf("发送消息失败，已重试 %d 次: %v", p.config.RetryTimes, lastErr),
 	}, lastErr

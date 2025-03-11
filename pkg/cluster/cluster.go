@@ -9,7 +9,6 @@ import (
 
 	"github.com/eason-lee/lmq/pkg/coordinator"
 	"github.com/eason-lee/lmq/pkg/network"
-	"github.com/eason-lee/lmq/pkg/protocol"
 	"github.com/eason-lee/lmq/pkg/store"
 	pb "github.com/eason-lee/lmq/proto"
 )
@@ -41,26 +40,26 @@ type ClusterManager struct {
 	stopCh      chan struct{}              // 停止信号
 
 	// 存储和协调器
-	store           *store.FileStore              // 存储引擎
-	coordinator     coordinator.Coordinator       // 协调器
-	partitionMgr    *coordinator.PartitionManager // 分区管理器
-	replicationFactor int                         // 复制因子
+	store             *store.FileStore              // 存储引擎
+	coordinator       coordinator.Coordinator       // 协调器
+	partitionMgr      *coordinator.PartitionManager // 分区管理器
+	replicationFactor int                           // 复制因子
 }
 
 // NewClusterManager 创建一个新的集群管理器
 func NewClusterManager(nodeID string, localAddr string, storeFile *store.FileStore, coord coordinator.Coordinator) *ClusterManager {
 	// 创建分区管理器，使用默认的最小移动重平衡器
 	partitionMgr := coordinator.NewPartitionManager(coord, store.DefaultRebalancer)
-	
+
 	return &ClusterManager{
-		localNodeID: nodeID,
-		localAddr:   localAddr,
-		nodes:       make(map[string]*Node),
-		clients:     make(map[string]*network.Client),
-		stopCh:      make(chan struct{}),
-		store:       storeFile,
-		coordinator: coord,
-		partitionMgr: partitionMgr,
+		localNodeID:       nodeID,
+		localAddr:         localAddr,
+		nodes:             make(map[string]*Node),
+		clients:           make(map[string]*network.Client),
+		stopCh:            make(chan struct{}),
+		store:             storeFile,
+		coordinator:       coord,
+		partitionMgr:      partitionMgr,
 		replicationFactor: 1, // 默认复制因子为1
 	}
 }
@@ -202,7 +201,7 @@ func (cm *ClusterManager) handleReplicationRequest(req *pb.Request) *pb.Response
 
 	publish := req.GetPublishData()
 	topic := publish.Topic
-	pbMessages := []*pb.Message{
+	messages := []*pb.Message{
 		{
 			Id:         fmt.Sprintf("%d", time.Now().UnixNano()), // 生成唯一ID
 			Topic:      topic,
@@ -212,20 +211,11 @@ func (cm *ClusterManager) handleReplicationRequest(req *pb.Request) *pb.Response
 		},
 	}
 
-	if len(pbMessages) == 0 {
+	if len(messages) == 0 {
 		return &pb.Response{
 			Status:  pb.Status_ERROR,
 			Message: "复制请求缺少消息",
 		}
-	}
-
-	// 转换消息
-	var messages []*protocol.Message
-	for _, pbMsg := range pbMessages {
-		msg := &protocol.Message{
-			Message: pbMsg,
-		}
-		messages = append(messages, msg)
 	}
 
 	// 保存消息到本地存储
@@ -602,7 +592,8 @@ func equalStringSlices(a, b []string) bool {
 }
 
 // ReplicateMessages 复制消息到其他节点
-func (cm *ClusterManager) ReplicateMessages(ctx context.Context, topic string, partition int, messages []*protocol.Message) error {
+// TODO 没有被使用
+func (cm *ClusterManager) ReplicateMessages(ctx context.Context, topic string, partition int, messages []*pb.Message) error {
 	// 检查当前节点是否是 leader
 	isLeader, err := cm.coordinator.IsPartitionLeader(ctx, topic, partition, cm.localNodeID)
 	if err != nil {
@@ -677,23 +668,10 @@ func (cm *ClusterManager) ReplicateMessages(ctx context.Context, topic string, p
 }
 
 // replicateToNode 复制消息到指定节点
-func (cm *ClusterManager) replicateToNode(ctx context.Context, nodeID string, topic string, partition int, messages []*protocol.Message) error {
+func (cm *ClusterManager) replicateToNode(ctx context.Context, nodeID string, topic string, partition int, messages []*pb.Message) error {
 	client, err := cm.getClient(nodeID)
 	if err != nil {
 		return err
-	}
-
-	// 转换消息为 protobuf 格式
-	pbMessages := make([]*pb.Message, 0, len(messages))
-	for _, msg := range messages {
-		pbMsg := &pb.Message{
-			Id:         msg.Message.Id,
-			Topic:      msg.Message.Topic,
-			Body:       msg.Message.Body,
-			Type:       pb.MessageType_NORMAL,
-			Attributes: msg.Message.Attributes,
-		}
-		pbMessages = append(pbMessages, pbMsg)
 	}
 
 	// 构建复制请求
@@ -702,7 +680,7 @@ func (cm *ClusterManager) replicateToNode(ctx context.Context, nodeID string, to
 		RequestData: &pb.Request_PublishData{
 			PublishData: &pb.PublishRequest{
 				Topic: topic,
-				Body:  pbMessages[0].Body,
+				Body:  messages[0].Body, // TODO 不应该是第一个消息内容
 				Type:  pb.MessageType_NORMAL,
 			},
 		},
@@ -714,23 +692,21 @@ func (cm *ClusterManager) replicateToNode(ctx context.Context, nodeID string, to
 		return err
 	}
 
-	// 检查响应
-	if resp.Status == pb.Status_ERROR {
+	if resp.Status != pb.Status_OK {
 		return fmt.Errorf("复制失败: %s", resp.Message)
 	}
 
 	return nil
 }
 
-
 // SyncNodes 从外部同步节点信息
 func (cm *ClusterManager) SyncNodes(nodes map[string]string) {
 	cm.mu.Lock()
-	
+
 	// 记录节点变化情况
 	nodeAdded := false
 	nodeRemoved := false
-	
+
 	// 更新现有节点
 	for nodeID, addr := range nodes {
 		if nodeID == cm.localNodeID {
@@ -774,19 +750,19 @@ func (cm *ClusterManager) SyncNodes(nodes map[string]string) {
 		}
 	}
 	cm.mu.Unlock()
-	
+
 	// 如果节点数量发生变化，触发分区重平衡
 	if nodeAdded || nodeRemoved {
 		log.Printf("集群节点发生变化，触发分区重平衡")
 		ctx := context.Background()
-		
+
 		// 如果有新节点加入
 		if nodeAdded {
 			if err := cm.partitionMgr.AddBrokerAndRebalance(ctx, "", cm.replicationFactor); err != nil {
 				log.Printf("添加节点后重平衡分区失败: %v", err)
 			}
 		}
-		
+
 		// 如果有节点移除
 		if nodeRemoved {
 			if err := cm.partitionMgr.RemoveBrokerAndRebalance(ctx, "", cm.replicationFactor); err != nil {

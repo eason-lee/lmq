@@ -957,24 +957,6 @@ func (c *ConsulCoordinator) CommitOffset(ctx context.Context, groupID string, to
 	return err
 }
 
-// GetConsumerOffset 获取消费位置
-func (c *ConsulCoordinator) GetConsumerOffset(ctx context.Context, groupID string, topic string) (int64, error) {
-	group, err := c.GetConsumerGroup(ctx, groupID)
-	if err != nil {
-		return 0, err
-	}
-
-	if group == nil {
-		return 0, fmt.Errorf("消费者组不存在: %s", groupID)
-	}
-
-	offset, ok := group.Offsets[topic]
-	if !ok {
-		return 0, nil
-	}
-
-	return offset, nil
-}
 
 // GetConsumerPartition 获取消费者分区
 func (c *ConsulCoordinator) GetConsumerPartition(ctx context.Context, groupID string, topic string) (int, error) {

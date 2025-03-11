@@ -6,7 +6,6 @@ import (
 	"io"
 	"net"
 
-	"github.com/eason-lee/lmq/pkg/protocol"
 	pb "github.com/eason-lee/lmq/proto"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/anypb"
@@ -147,33 +146,4 @@ func (c *Client) Send(reqType string, reqMsg interface{}) (*pb.Response, error) 
 
 func (c *Client) Close() error {
 	return c.conn.Close()
-}
-
-// Receive 接收服务器推送的消息
-func (c *Client) Receive() (*protocol.Message, error) {
-	// 读取消息长度
-	lenBuf := make([]byte, 4)
-	if _, err := io.ReadFull(c.conn, lenBuf); err != nil {
-		return nil, fmt.Errorf("读取消息长度失败: %w", err)
-	}
-
-	// 解析消息长度
-	msgLen := binary.BigEndian.Uint32(lenBuf)
-
-	// 读取消息内容
-	msgBuf := make([]byte, msgLen)
-	if _, err := io.ReadFull(c.conn, msgBuf); err != nil {
-		return nil, fmt.Errorf("读取消息内容失败: %w", err)
-	}
-
-	// 反序列化消息
-	var pbMsg pb.Message
-	if err := proto.Unmarshal(msgBuf, &pbMsg); err != nil {
-		return nil, fmt.Errorf("反序列化消息失败: %w", err)
-	}
-
-	// 转换为内部消息格式
-	return &protocol.Message{
-		Message: &pbMsg,
-	}, nil
 }

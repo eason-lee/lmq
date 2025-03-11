@@ -12,6 +12,9 @@ enum MessageType {
   NORMAL = 1;
   DELAYED = 2;
   DEAD_LETTER = 3;
+  COMPRESSED_GZIP = 4;
+  COMPRESSED_SNAPPY = 5;
+  COMPRESSED_LZ4 = 6;
 }
 
 // 响应状态枚举

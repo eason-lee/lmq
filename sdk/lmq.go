@@ -6,7 +6,7 @@ import (
 
 	"github.com/eason-lee/lmq/pkg/consumer"
 	"github.com/eason-lee/lmq/pkg/producer"
-	"github.com/eason-lee/lmq/pkg/protocol"
+	pb "github.com/eason-lee/lmq/proto"
 )
 
 // Config LMQ SDK 配置
@@ -17,6 +17,8 @@ type Config struct {
 
 	// 生产者配置
 	RetryTimes int // 发送重试次数
+	Compression string // 压缩算法: "gzip", "snappy", "lz4" 或 "none"
+	CompressMinSize int // 启用压缩的最小消息大小(字节)
 
 	// 消费者配置
 	GroupID        string        // 消费者组ID
@@ -64,6 +66,15 @@ func NewClient(config *Config) (*Client, error) {
 
 	if config.PullInterval <= 0 {
 		config.PullInterval = 5 * time.Second
+	}
+	
+	// 设置压缩相关默认值
+	if config.Compression == "" {
+		config.Compression = "none" // 默认不压缩
+	}
+	
+	if config.CompressMinSize <= 0 {
+		config.CompressMinSize = 1024 // 默认1KB以上启用压缩
 	}
 
 	return &Client{
@@ -150,7 +161,7 @@ func (c *Client) SendBatch(topic string, messages [][]byte) ([]*SendResult, erro
 }
 
 // Subscribe 订阅主题并消费消息
-func (c *Client) Subscribe(topics []string, handler func([]*protocol.Message)) error {
+func (c *Client) Subscribe(topics []string, handler func([]*pb.Message)) error {
 	cons, err := c.getConsumer(topics)
 	if err != nil {
 		return err
@@ -194,9 +205,9 @@ func (c *Client) getProducer() (*producer.Producer, error) {
 
 	// 创建生产者配置
 	producerConfig := &producer.ProducerConfig{
-		Brokers:    c.config.Brokers,
-		RetryTimes: c.config.RetryTimes,
-		Timeout:    c.config.Timeout,
+		Brokers:         c.config.Brokers,
+		RetryTimes:      c.config.RetryTimes,
+		Timeout:         c.config.Timeout,
 	}
 
 	// 创建生产者

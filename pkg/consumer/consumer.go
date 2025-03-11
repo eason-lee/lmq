@@ -7,9 +7,7 @@ import (
 	"time"
 
 	"github.com/eason-lee/lmq/pkg/network"
-	"github.com/eason-lee/lmq/pkg/protocol"
 	pb "github.com/eason-lee/lmq/proto"
-	"google.golang.org/protobuf/types/known/anypb"
 )
 
 // ConsumerConfig 消费者配置
@@ -31,7 +29,7 @@ type Consumer struct {
 	stopCh     chan struct{}
 	wg         sync.WaitGroup
 	mu         sync.RWMutex
-	handler    func([]*protocol.Message)
+	handler    func([]*pb.Message)
 }
 
 // NewConsumer 创建一个新的消费者
@@ -70,7 +68,7 @@ func NewConsumer(config *ConsumerConfig) (*Consumer, error) {
 }
 
 // Subscribe 订阅主题并开始消费
-func (c *Consumer) Subscribe(handler func([]*protocol.Message)) error {
+func (c *Consumer) Subscribe(handler func([]*pb.Message)) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -130,7 +128,7 @@ func (c *Consumer) pullLoop() {
 					// 如果启用了自动提交，提交消息确认
 					if c.config.AutoCommit {
 						lastMsg := messages[len(messages)-1]
-						if err := c.Commit(topic, []string{lastMsg.Message.Id}); err != nil {
+						if err := c.Commit(topic, []string{lastMsg.Id}); err != nil {
 							log.Printf("自动提交失败: %v", err)
 						}
 					}
@@ -141,7 +139,7 @@ func (c *Consumer) pullLoop() {
 }
 
 // pull 从指定主题拉取消息
-func (c *Consumer) pull(topic string) ([]*protocol.Message, error) {
+func (c *Consumer) pull(topic string) ([]*pb.Message, error) {
 	// 创建拉取请求
 	req := &pb.PullRequest{
 		GroupId:     c.config.GroupID,
@@ -169,15 +167,7 @@ func (c *Consumer) pull(topic string) ([]*protocol.Message, error) {
 		return nil, fmt.Errorf("响应数据类型错误")
 	}
 
-	// 转换消息格式
-	messages := make([]*protocol.Message, len(batchResp.Messages))
-	for i, msg := range batchResp.Messages {
-		messages[i] = &protocol.Message{
-			Message: msg,
-		}
-	}
-
-	return messages, nil
+	return batchResp.Messages, nil
 }
 
 // Commit 提交消息确认
@@ -224,23 +214,4 @@ func (c *Consumer) Close() error {
 
 	c.subscribed = false
 	return nil
-}
-
-// mustPackAny 将值打包为 Any 类型
-func mustPackAny(value interface{}) *anypb.Any {
-	var any *anypb.Any
-	var err error
-
-	switch v := value.(type) {
-	case string:
-		any, err = anypb.New(&pb.Response{Message: v})
-	default:
-		panic(fmt.Sprintf("unsupported type: %T", value))
-	}
-
-	if err != nil {
-		panic(err)
-	}
-
-	return any
 }

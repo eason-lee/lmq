@@ -75,6 +75,7 @@ message PullRequest {
   string topic = 2;
   int32 max_messages = 3; // 最大拉取消息数
   int64 timeout_ms = 4;   // 等待超时时间（毫秒）
+  string consumer_id = 5; // 消费者ID
 }
 
 // 确认请求

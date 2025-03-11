@@ -30,6 +30,7 @@ type Consumer struct {
 	wg         sync.WaitGroup
 	mu         sync.RWMutex
 	handler    func([]*pb.Message)
+	consumerID string       // 消费者唯一标识
 }
 
 // NewConsumer 创建一个新的消费者
@@ -60,10 +61,14 @@ func NewConsumer(config *ConsumerConfig) (*Consumer, error) {
 		return nil, fmt.Errorf("连接 broker 失败: %w", err)
 	}
 
+	// 生成唯一的消费者ID
+	consumerID := fmt.Sprintf("%s-%d", config.GroupID, time.Now().UnixNano())
+
 	return &Consumer{
-		config: config,
-		client: client,
-		stopCh: make(chan struct{}),
+		config:     config,
+		client:     client,
+		stopCh:     make(chan struct{}),
+		consumerID: consumerID,
 	}, nil
 }
 
@@ -145,6 +150,7 @@ func (c *Consumer) pull(topic string) ([]*pb.Message, error) {
 		GroupId:     c.config.GroupID,
 		Topic:       topic,
 		MaxMessages: int32(c.config.MaxPullRecords),
+		ConsumerId:  c.consumerID,
 	}
 
 	// 发送拉取请求

@@ -8,8 +8,8 @@ import (
 	"sync"
 	"time"
 
-	"google.golang.org/protobuf/proto"
 	pb "github.com/eason-lee/lmq/proto"
+	"google.golang.org/protobuf/proto"
 )
 
 // 错误定义
@@ -19,16 +19,17 @@ var (
 
 // Segment 表示一个日志段
 type Segment struct {
-	baseOffset int64        // 段的基础偏移量
-	nextOffset int64        // 下一条消息的偏移量
-	size       int64        // 当前段大小
-	maxSize    int64        // 段的最大大小
-	dataFile   *os.File     // 数据文件
-	indexFile  *os.File     // 索引文件
-	mu         sync.RWMutex // 段级别的锁
-	index      []MessageIndex
-	dir        string
-	ct time.Time
+	baseOffset  int64        // 段的基础偏移量
+	nextOffset  int64        // 下一条消息的偏移量
+	size        int64        // 当前段大小
+	maxSize     int64        // 段的最大大小
+	dataFile    *os.File     // 数据文件
+	indexFile   *os.File     // 索引文件
+	mu          sync.RWMutex // 段级别的锁
+	index       []MessageIndex
+	dir         string
+	ct          time.Time
+	sparseIndex *SparseIndex // 稀疏索引
 }
 
 // MessageIndex 消息索引记录
@@ -43,6 +44,7 @@ type MessageIndex struct {
 func newSegment(dir string, baseOffset int64, maxSize int64) (*Segment, error) {
 	dataPath := filepath.Join(dir, fmt.Sprintf("%020d%s", baseOffset, DataFileSuffix))
 	indexPath := filepath.Join(dir, fmt.Sprintf("%020d%s", baseOffset, IndexFileSuffix))
+	sparseIndexPath := filepath.Join(dir, fmt.Sprintf("%020d.sparse", baseOffset))
 
 	// 打开数据文件
 	dataFile, err := os.OpenFile(dataPath, os.O_CREATE|os.O_RDWR|os.O_APPEND, 0644)
@@ -65,15 +67,24 @@ func newSegment(dir string, baseOffset int64, maxSize int64) (*Segment, error) {
 		return nil, fmt.Errorf("获取文件信息失败: %w", err)
 	}
 
+	// 创建稀疏索引
+	sparseIndex, err := NewSparseIndex(sparseIndexPath, DefaultSparseIndexConfig)
+	if err != nil {
+		dataFile.Close()
+		indexFile.Close()
+		return nil, fmt.Errorf("创建稀疏索引失败: %w", err)
+	}
+
 	return &Segment{
-		baseOffset: baseOffset,
-		nextOffset: baseOffset,
-		size:       dataInfo.Size(),
-		maxSize:    maxSize,
-		dataFile:   dataFile,
-		indexFile:  indexFile,
-		dir:        dir,
-		ct: time.Now(),
+		baseOffset:  baseOffset,
+		nextOffset:  baseOffset,
+		size:        dataInfo.Size(),
+		maxSize:     maxSize,
+		dataFile:    dataFile,
+		indexFile:   indexFile,
+		dir:         dir,
+		ct:          time.Now(),
+		sparseIndex: sparseIndex,
 	}, nil
 }
 
@@ -118,14 +129,20 @@ func (s *Segment) Write(msg *pb.Message) error {
 		timestamp = msg.Timestamp.AsTime().UnixNano()
 	}
 
+	offset := s.baseOffset + int64(len(s.index))
 	index := MessageIndex{
-		Offset:    s.baseOffset + int64(len(s.index)),
+		Offset:    offset,
 		Position:  position,
 		Size:      int32(len(msgData)),
 		Timestamp: timestamp,
 	}
 	s.index = append(s.index, index)
 	s.size += int64(len(msgData))
+
+	// 更新稀疏索引
+	if err := s.sparseIndex.AddMessage(msg, offset, position); err != nil {
+		return fmt.Errorf("更新稀疏索引失败: %w", err)
+	}
 
 	return nil
 }
@@ -140,104 +157,60 @@ func (s *Segment) Read(offset int64, count int) ([]*pb.Message, error) {
 		return nil, fmt.Errorf("偏移量 %d 不在段范围内 [%d, %d)", offset, s.baseOffset, s.nextOffset)
 	}
 
-	// 读取索引
-	indexes, err := s.readIndexes(offset, count)
+	// 使用稀疏索引找到最近的位置
+	position, err := s.sparseIndex.FindPosition(offset)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("查找稀疏索引失败: %w", err)
 	}
 
-	messages := make([]*pb.Message, 0, len(indexes))
-	for _, idx := range indexes {
-		// 读取消息数据
-		data := make([]byte, idx.Size)
-		if _, err := s.dataFile.ReadAt(data, idx.Position); err != nil {
-			return nil, fmt.Errorf("读取消息数据失败: %w", err)
-		}
+	// 从找到的位置开始读取消息
+	messages := make([]*pb.Message, 0, count)
+	currentPosition := position
 
+	for len(messages) < count {
 		// 读取消息长度
-		if len(data) < 4 {
-			return nil, fmt.Errorf("数据长度不足")
+		lenBuf := make([]byte, 4)
+		if _, err := s.dataFile.ReadAt(lenBuf, currentPosition); err != nil {
+			break // 到达文件末尾
 		}
-		msgLen := binary.BigEndian.Uint32(data[:4])
-		if len(data) < int(msgLen)+4 {
-			return nil, fmt.Errorf("数据长度不匹配")
+		msgLen := binary.BigEndian.Uint32(lenBuf)
+
+		// 读取消息数据
+		data := make([]byte, msgLen+4)
+		if _, err := s.dataFile.ReadAt(data, currentPosition); err != nil {
+			break
 		}
 
 		// 反序列化消息
 		msg := &pb.Message{}
-		if err := proto.Unmarshal(data[4:4+msgLen], msg); err != nil {
+		if err := proto.Unmarshal(data[4:], msg); err != nil {
 			return nil, fmt.Errorf("反序列化消息失败: %w", err)
 		}
 
-		messages = append(messages, msg)
+		// 检查是否达到目标偏移量
+		if currentPosition >= position {
+			messages = append(messages, msg)
+		}
+
+		// 更新位置
+		currentPosition += int64(len(data))
 	}
 
 	return messages, nil
 }
 
-// readIndexes 读取索引记录
-func (s *Segment) readIndexes(offset int64, count int) ([]MessageIndex, error) {
-	// 计算索引文件中的位置
-	relativeOffset := offset - s.baseOffset
-	position := relativeOffset * 28 // 每个索引条目28字节
-
-	// 获取索引文件大小
-	info, err := s.indexFile.Stat()
-	if err != nil {
-		return nil, fmt.Errorf("获取索引文件信息失败: %w", err)
-	}
-
-	// 计算可读取的最大条目数
-	maxEntries := (info.Size() - position) / 28
-	if maxEntries <= 0 {
-		return nil, nil
-	}
-
-	// 限制读取数量
-	if count > int(maxEntries) {
-		count = int(maxEntries)
-	}
-
-	// 读取索引数据
-	buf := make([]byte, count*28)
-	if _, err := s.indexFile.ReadAt(buf, position); err != nil {
-		return nil, fmt.Errorf("读取索引数据失败: %w", err)
-	}
-
-	// 解析索引记录
-	indexes := make([]MessageIndex, count)
-	for i := 0; i < count; i++ {
-		pos := i * 28
-		indexes[i] = MessageIndex{
-			Offset:    int64(binary.BigEndian.Uint64(buf[pos : pos+8])),
-			Position:  int64(binary.BigEndian.Uint64(buf[pos+8 : pos+16])),
-			Size:      int32(binary.BigEndian.Uint32(buf[pos+16 : pos+20])),
-			Timestamp: int64(binary.BigEndian.Uint64(buf[pos+20 : pos+28])),
-		}
-	}
-
-	return indexes, nil
-}
-
-// writeIndex 写入索引记录
-func (s *Segment) writeIndex(index *MessageIndex) error {
-	buf := make([]byte, 28) // 8 + 8 + 4 + 8 bytes
-	binary.BigEndian.PutUint64(buf[0:8], uint64(index.Offset))
-	binary.BigEndian.PutUint64(buf[8:16], uint64(index.Position))
-	binary.BigEndian.PutUint32(buf[16:20], uint32(index.Size))
-	binary.BigEndian.PutUint64(buf[20:28], uint64(index.Timestamp))
-
-	if _, err := s.indexFile.Write(buf); err != nil {
-		return err
-	}
-
-	return nil
-}
 
 // Close 关闭段
 func (s *Segment) Close() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
+	// 关闭稀疏索引
+	if s.sparseIndex != nil {
+		if err := s.sparseIndex.Close(); err != nil {
+			return fmt.Errorf("关闭稀疏索引失败: %w", err)
+		}
+	}
 
 	if err := s.dataFile.Close(); err != nil {
 		return err
@@ -248,33 +221,6 @@ func (s *Segment) Close() error {
 	}
 
 	return nil
-}
-
-// getLastMessageTimestamp 获取段中最后一条消息的时间戳
-func (s *Segment) getLastMessageTimestamp() (int64, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	// 获取索引文件大小
-	info, err := s.indexFile.Stat()
-	if err != nil {
-		return 0, fmt.Errorf("获取索引文件信息失败: %w", err)
-	}
-
-	// 如果没有消息，返回0
-	if info.Size() == 0 {
-		return 0, nil
-	}
-
-	// 读取最后一个索引条目
-	buf := make([]byte, 28)
-	if _, err := s.indexFile.ReadAt(buf, info.Size()-28); err != nil {
-		return 0, fmt.Errorf("读取索引失败: %w", err)
-	}
-
-	// 解析时间戳
-	timestamp := int64(binary.BigEndian.Uint64(buf[20:28]))
-	return timestamp, nil
 }
 
 // GetLatestOffset 获取段的最新偏移量
@@ -338,7 +284,7 @@ func (s *Segment) GetOffset(messageID string) (int64, error) {
 func (s *Segment) readMessage(position int64, size int32) (*pb.Message, error) {
 	// 打开数据文件
 	file := s.dataFile
-	
+
 	defer file.Close()
 
 	// 定位到消息位置

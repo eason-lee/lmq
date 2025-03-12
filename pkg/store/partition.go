@@ -283,3 +283,18 @@ func (p *Partition) GetOffset(messageID string) (int64, error) {
 
 	return 0, fmt.Errorf("消息不存在: %s", messageID)
 }
+
+// Sync 同步所有段的数据到磁盘
+func (p *Partition) Sync() error {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+
+	// 同步所有段
+	for _, segment := range p.segments {
+		if err := segment.Sync(); err != nil {
+			return fmt.Errorf("同步段数据失败: %w", err)
+		}
+	}
+
+	return nil
+}

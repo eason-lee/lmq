@@ -206,8 +206,6 @@ func (fs *FileStore) CreatePartition(topic string, partID int) error {
 	return nil
 }
 
-
-
 // GetMessages 获取指定主题和分区的所有消息
 func (fs *FileStore) GetMessages(topic string) ([]*pb.Message, error) {
 	fs.mu.RLock()
@@ -275,7 +273,7 @@ func (fs *FileStore) mustGetPartition(topic string, partition int) (*Partition, 
 	fs.mu.RLock()
 	p, ok := fs.partitions[topic][partition]
 	fs.mu.RUnlock()
-	if!ok {
+	if !ok {
 		return nil, fmt.Errorf("分区不存在: %s-%d", topic, partition)
 	}
 	return p, nil
@@ -284,10 +282,30 @@ func (fs *FileStore) mustGetPartition(topic string, partition int) (*Partition, 
 // CleanupSegments 使用指定的清理策略清理段
 func (fs *FileStore) CleanupSegments(topic string, partitionID int, policy CleanupPolicy) error {
 	p, err := fs.mustGetPartition(topic, partitionID)
-	if err!= nil {
+	if err != nil {
 		return err
 	}
 
 	// 应用清理策略
 	return p.ApplyCleanupPolicy(policy)
+}
+
+// Sync 同步所有分区数据到磁盘
+func (fs *FileStore) Sync() error {
+	fs.mu.RLock()
+	defer fs.mu.RUnlock()
+
+	var errs []error
+	for _, topicPartitions := range fs.partitions {
+		for _, partition := range topicPartitions {
+			if err := partition.Sync(); err != nil {
+				errs = append(errs, fmt.Errorf("同步分区数据失败: %w", err))
+			}
+		}
+	}
+
+	if len(errs) > 0 {
+		return fmt.Errorf("部分分区同步失败: %v", errs)
+	}
+	return nil
 }

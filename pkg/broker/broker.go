@@ -41,7 +41,7 @@ type Broker struct {
 	store           store.Store
 	subscribers     map[string][]*Subscriber // 主题 -> 订阅者列表
 	mu              sync.RWMutex
-	unackedMessages map[string]*pb.Message // 消息ID -> 消息
+	unackedMessages map[string]*pb.Message  // 消息ID -> 消息
 	clusterMgr      *cluster.ClusterManager // 集群管理器
 	coordinator     coordinator.Coordinator // 协调器
 	stopCh          chan struct{}           // 停止信号
@@ -181,6 +181,25 @@ func NewBroker(config *BrokerConfig) (*Broker, error) {
 	return broker, nil
 }
 
+// StartStorageSyncTask 启动存储同步任务
+func (b *Broker) StartStorageSyncTask(interval time.Duration) {
+	go func() {
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-ticker.C:
+				if err := b.store.Sync(); err != nil {
+					log.Printf("同步存储数据失败: %v", err)
+				}
+			case <-b.stopCh:
+				return
+			}
+		}
+	}()
+}
+
 // Start 启动broker服务
 func (b *Broker) Start(ctx context.Context) error {
 	if err := b.server.Start(); err != nil {
@@ -196,6 +215,9 @@ func (b *Broker) Start(ctx context.Context) error {
 
 	// 启动段清理任务，使用默认的清理策略
 	b.StartCleanupTask(1*time.Hour, store.DefaultCleanupPolicy)
+
+	// 启动存储同步任务，每5秒同步一次
+	b.StartStorageSyncTask(5 * time.Second)
 
 	// 启动节点同步任务
 	go b.startNodeSyncTask(ctx, 10*time.Second)

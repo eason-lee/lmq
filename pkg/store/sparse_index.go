@@ -23,11 +23,11 @@ var DefaultSparseIndexConfig = SparseIndexConfig{
 
 // SparseIndex 稀疏索引实现
 type SparseIndex struct {
-	config      SparseIndexConfig
-	indexFile   *os.File
-	entries     []SparseIndexEntry
+	config       SparseIndexConfig
+	indexFile    *os.File
+	entries      []SparseIndexEntry
 	messageCount int
-	mu          sync.RWMutex
+	mu           sync.RWMutex
 }
 
 // SparseIndexEntry 稀疏索引条目
@@ -103,7 +103,7 @@ func (si *SparseIndex) AddMessage(msg *pb.Message, offset int64, position int64)
 	si.messageCount++
 
 	// 检查是否需要创建索引项
-	if !si.config.Enabled || si.messageCount % si.config.IndexInterval != 0 {
+	if !si.config.Enabled || si.messageCount%si.config.IndexInterval != 0 {
 		return nil
 	}
 

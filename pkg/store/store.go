@@ -16,4 +16,5 @@ type Store interface {
 	GetTopics() []string
 	GetPartitions(topic string) []int
 	CleanupSegments(topic string, partition int, policy CleanupPolicy) error
+	Sync() error 
 }

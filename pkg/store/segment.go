@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"syscall"
 	"time"
 
 	pb "github.com/eason-lee/lmq/proto"
@@ -40,8 +41,8 @@ type MessageIndex struct {
 	Timestamp int64 // 消息时间戳
 }
 
-// newSegment 创建新的段
-func newSegment(dir string, baseOffset int64, maxSize int64) (*Segment, error) {
+// NewSegment 创建新的段
+func NewSegment(dir string, baseOffset int64, maxSize int64) (*Segment, error) {
 	dataPath := filepath.Join(dir, fmt.Sprintf("%020d%s", baseOffset, DataFileSuffix))
 	indexPath := filepath.Join(dir, fmt.Sprintf("%020d%s", baseOffset, IndexFileSuffix))
 	sparseIndexPath := filepath.Join(dir, fmt.Sprintf("%020d.sparse", baseOffset))
@@ -175,11 +176,14 @@ func (s *Segment) Read(offset int64, count int) ([]*pb.Message, error) {
 		}
 		msgLen := binary.BigEndian.Uint32(lenBuf)
 
-		// 读取消息数据
-		data := make([]byte, msgLen+4)
-		if _, err := s.dataFile.ReadAt(data, currentPosition); err != nil {
-			break
+		// 使用零拷贝方式读取消息数据
+		data, err := s.ReadWithZeroCopy(currentPosition, int32(msgLen+4))
+		if err != nil {
+			return nil, fmt.Errorf("零拷贝读取消息失败: %w", err)
 		}
+
+		// 确保在函数返回前释放内存映射
+		defer UnmapMemory(data)
 
 		// 反序列化消息
 		msg := &pb.Message{}
@@ -198,7 +202,6 @@ func (s *Segment) Read(offset int64, count int) ([]*pb.Message, error) {
 
 	return messages, nil
 }
-
 
 // Close 关闭段
 func (s *Segment) Close() error {
@@ -236,6 +239,36 @@ func (s *Segment) GetLatestOffset() (int64, error) {
 	// 返回最后一条消息的偏移量
 	lastIndex := s.index[len(s.index)-1]
 	return lastIndex.Offset, nil
+}
+
+// ReadWithZeroCopy 使用零拷贝方式读取数据
+func (s *Segment) ReadWithZeroCopy(offset int64, size int32) ([]byte, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	// 使用mmap实现零拷贝
+	var data []byte
+	var err error
+
+	// 获取文件描述符
+	fd := int(s.dataFile.Fd())
+
+	// 使用syscall.Mmap进行内存映射
+	data, err = syscall.Mmap(fd, offset, int(size), syscall.PROT_READ, syscall.MAP_SHARED)
+	if err != nil {
+		return nil, fmt.Errorf("内存映射失败: %w", err)
+	}
+
+	// 注意：调用方需要在使用完毕后调用syscall.Munmap(data)释放映射
+	return data, nil
+}
+
+// UnmapMemory 释放内存映射
+func UnmapMemory(data []byte) error {
+	if data == nil {
+		return nil
+	}
+	return syscall.Munmap(data)
 }
 
 // Delete 删除段文件
@@ -282,21 +315,14 @@ func (s *Segment) GetOffset(messageID string) (int64, error) {
 
 // readMessage 从指定位置读取消息
 func (s *Segment) readMessage(position int64, size int32) (*pb.Message, error) {
-	// 打开数据文件
-	file := s.dataFile
-
-	defer file.Close()
-
-	// 定位到消息位置
-	if _, err := file.Seek(position, 0); err != nil {
-		return nil, err
+	// 使用零拷贝方式读取消息数据
+	data, err := s.ReadWithZeroCopy(position, size)
+	if err != nil {
+		return nil, fmt.Errorf("零拷贝读取消息失败: %w", err)
 	}
 
-	// 读取消息数据
-	data := make([]byte, size)
-	if _, err := file.Read(data); err != nil {
-		return nil, err
-	}
+	// 确保在函数返回前释放内存映射
+	defer UnmapMemory(data)
 
 	// 解析消息
 	message := &pb.Message{}

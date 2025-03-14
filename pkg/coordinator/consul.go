@@ -977,30 +977,6 @@ func (c *ConsulCoordinator) GetConsumerPartition(ctx context.Context, groupID st
 	return partition, nil
 }
 
-// hash 计算字符串的哈希值
-func hash(s string) uint32 {
-	var h uint32
-	for i := 0; i < len(s); i++ {
-		h = h*31 + uint32(s[i])
-	}
-	return h
-}
-
-// parseOffset 从消息ID中提取offset
-func parseOffset(messageID string) int64 {
-	parts := strings.Split(messageID, "-")
-	if len(parts) != 2 {
-		return 0
-	}
-
-	offset, err := strconv.ParseInt(parts[1], 10, 64)
-	if err != nil {
-		return 0
-	}
-
-	return offset
-}
-
 // AddToISR 添加节点到 ISR 列表
 func (c *ConsulCoordinator) AddToISR(ctx context.Context, topic string, partitionID int, nodeID string) error {
 	partition, err := c.GetPartition(ctx, topic, partitionID)

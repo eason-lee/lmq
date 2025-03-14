@@ -53,7 +53,7 @@ func NewPartition(dir string) (*Partition, error) {
 
 	// 如果没有段,创建第一个段
 	if len(p.segments) == 0 {
-		segment, err := newSegment(dir, 0, p.maxSegmentSize)
+		segment, err := NewSegment(dir, 0, p.maxSegmentSize)
 		if err != nil {
 			return nil, fmt.Errorf("创建初始段失败: %w", err)
 		}
@@ -93,7 +93,7 @@ func (p *Partition) loadSegments() error {
 
 	// 加载每个段
 	for _, baseOffset := range baseOffsets {
-		segment, err := newSegment(p.dir, baseOffset, p.maxSegmentSize)
+		segment, err := NewSegment(p.dir, baseOffset, p.maxSegmentSize)
 		if err != nil {
 			return fmt.Errorf("加载段失败 [%d]: %w", baseOffset, err)
 		}
@@ -117,7 +117,7 @@ func (p *Partition) Write(messages []*pb.Message) error {
 				return fmt.Errorf("获取最新偏移量失败: %w", err)
 			}
 
-			newSegment, err := newSegment(p.dir, nextOffset, p.maxSegmentSize)
+			newSegment, err := NewSegment(p.dir, nextOffset, p.maxSegmentSize)
 			if err != nil {
 				return fmt.Errorf("创建新段失败: %w", err)
 			}

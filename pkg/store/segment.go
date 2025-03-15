@@ -89,65 +89,6 @@ func NewSegment(dir string, baseOffset int64, maxSize int64) (*Segment, error) {
 	}, nil
 }
 
-// Write 写入消息到段
-func (s *Segment) Write(msg *pb.Message) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	// 序列化消息
-	data, err := proto.Marshal(msg)
-	if err != nil {
-		return fmt.Errorf("序列化消息失败: %w", err)
-	}
-
-	// 添加消息长度前缀
-	lenBuf := make([]byte, 4)
-	binary.BigEndian.PutUint32(lenBuf, uint32(len(data)))
-
-	// 组合长度和数据
-	msgData := make([]byte, len(lenBuf)+len(data))
-	copy(msgData[:4], lenBuf)
-	copy(msgData[4:], data)
-
-	// 检查段大小
-	if s.size+int64(len(msgData)) > s.maxSize {
-		return ErrSegmentFull
-	}
-
-	// 写入数据
-	position, err := s.dataFile.Seek(0, os.SEEK_END)
-	if err != nil {
-		return fmt.Errorf("获取文件位置失败: %w", err)
-	}
-
-	if _, err := s.dataFile.Write(msgData); err != nil {
-		return fmt.Errorf("写入数据失败: %w", err)
-	}
-
-	// 更新索引
-	timestamp := time.Now().UnixNano()
-	if msg.Timestamp != nil {
-		timestamp = msg.Timestamp.AsTime().UnixNano()
-	}
-
-	offset := s.baseOffset + int64(len(s.index))
-	index := MessageIndex{
-		Offset:    offset,
-		Position:  position,
-		Size:      int32(len(msgData)),
-		Timestamp: timestamp,
-	}
-	s.index = append(s.index, index)
-	s.size += int64(len(msgData))
-
-	// 更新稀疏索引
-	if err := s.sparseIndex.AddMessage(msg, offset, position); err != nil {
-		return fmt.Errorf("更新稀疏索引失败: %w", err)
-	}
-
-	return nil
-}
-
 // Read 从段读取消息
 func (s *Segment) Read(offset int64, count int) ([]*pb.Message, error) {
 	s.mu.Lock()
@@ -331,4 +272,101 @@ func (s *Segment) readMessage(position int64, size int32) (*pb.Message, error) {
 	}
 
 	return message, nil
+}
+
+// WriteBatch 批量写入消息到段
+func (s *Segment) WriteBatch(messages []*pb.Message) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	// 预先计算总大小，以检查段容量
+	totalSize := int64(0)
+	msgDataList := make([][]byte, 0, len(messages))
+	timestamps := make([]int64, 0, len(messages))
+
+	// 第一步：序列化所有消息并计算总大小
+	for _, msg := range messages {
+		// 序列化消息
+		data, err := proto.Marshal(msg)
+		if err != nil {
+			return fmt.Errorf("序列化消息失败: %w", err)
+		}
+
+		// 添加消息长度前缀
+		lenBuf := make([]byte, 4)
+		binary.BigEndian.PutUint32(lenBuf, uint32(len(data)))
+
+		// 组合长度和数据
+		msgData := make([]byte, len(lenBuf)+len(data))
+		copy(msgData[:4], lenBuf)
+		copy(msgData[4:], data)
+
+		msgDataList = append(msgDataList, msgData)
+		totalSize += int64(len(msgData))
+
+		// 记录时间戳
+		timestamp := time.Now().UnixNano()
+		if msg.Timestamp != nil {
+			timestamp = msg.Timestamp.AsTime().UnixNano()
+		}
+		timestamps = append(timestamps, timestamp)
+	}
+
+	// 检查段大小
+	if s.size+totalSize > s.maxSize {
+		return ErrSegmentFull
+	}
+
+	// 第二步：一次性分配足够大的缓冲区
+	buffer := make([]byte, totalSize)
+	offset := 0
+
+	// 第三步：获取文件当前位置
+	startPosition, err := s.dataFile.Seek(0, os.SEEK_END)
+	if err != nil {
+		return fmt.Errorf("获取文件位置失败: %w", err)
+	}
+
+	// 第四步：将所有消息复制到缓冲区
+	positions := make([]int64, 0, len(messages))
+	sizes := make([]int32, 0, len(messages))
+
+	for _, msgData := range msgDataList {
+		// 复制到缓冲区
+		copy(buffer[offset:], msgData)
+
+		// 记录位置和大小
+		positions = append(positions, startPosition+int64(offset))
+		sizes = append(sizes, int32(len(msgData)))
+
+		// 更新偏移量
+		offset += len(msgData)
+	}
+
+	// 第五步：一次性写入所有数据
+	if _, err := s.dataFile.Write(buffer); err != nil {
+		return fmt.Errorf("批量写入数据失败: %w", err)
+	}
+
+	// 第六步：更新索引
+	for i := range messages {
+		msgOffset := s.baseOffset + int64(len(s.index))
+		index := MessageIndex{
+			Offset:    msgOffset,
+			Position:  positions[i],
+			Size:      sizes[i],
+			Timestamp: timestamps[i],
+		}
+		s.index = append(s.index, index)
+
+		// 更新稀疏索引
+		if err := s.sparseIndex.AddMessage(messages[i], msgOffset, positions[i]); err != nil {
+			return fmt.Errorf("更新稀疏索引失败: %w", err)
+		}
+	}
+
+	// 更新段大小
+	s.size += totalSize
+
+	return nil
 }

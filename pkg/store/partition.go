@@ -108,31 +108,50 @@ func (p *Partition) Write(messages []*pb.Message) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
-	for _, msg := range messages {
-		// 检查当前段是否已满
-		if p.activeSegment.size >= p.maxSegmentSize {
-			// 创建新段
-			nextOffset, err := p.activeSegment.GetLatestOffset()
-			if err != nil {
-				return fmt.Errorf("获取最新偏移量失败: %w", err)
-			}
-
-			newSegment, err := NewSegment(p.dir, nextOffset, p.maxSegmentSize)
-			if err != nil {
-				return fmt.Errorf("创建新段失败: %w", err)
-			}
-
-			p.segments = append(p.segments, newSegment)
-			p.activeSegment = newSegment
-		}
-
-		// 写入消息到活动段
-		if err := p.activeSegment.Write(msg); err != nil {
-			return fmt.Errorf("写入消息到段失败: %w", err)
-		}
+	// 如果消息为空，直接返回
+	if len(messages) == 0 {
+		return nil
 	}
 
-	return nil
+	// 检查当前段是否已满
+	if p.activeSegment.size >= p.maxSegmentSize {
+		// 创建新段
+		nextOffset, err := p.activeSegment.GetLatestOffset()
+		if err != nil {
+			return fmt.Errorf("获取最新偏移量失败: %w", err)
+		}
+
+		newSegment, err := NewSegment(p.dir, nextOffset, p.maxSegmentSize)
+		if err != nil {
+			return fmt.Errorf("创建新段失败: %w", err)
+		}
+
+		p.segments = append(p.segments, newSegment)
+		p.activeSegment = newSegment
+	}
+
+	// 使用批量写入方法写入消息到活动段
+	err := p.activeSegment.WriteBatch(messages)
+	if err == ErrSegmentFull {
+		// 如果段已满，创建新段并重试
+		nextOffset, err := p.activeSegment.GetLatestOffset()
+		if err != nil {
+			return fmt.Errorf("获取最新偏移量失败: %w", err)
+		}
+
+		newSegment, err := NewSegment(p.dir, nextOffset, p.maxSegmentSize)
+		if err != nil {
+			return fmt.Errorf("创建新段失败: %w", err)
+		}
+
+		p.segments = append(p.segments, newSegment)
+		p.activeSegment = newSegment
+
+		// 重试写入
+		return p.activeSegment.WriteBatch(messages)
+	}
+
+	return err
 }
 
 // Read 读取消息

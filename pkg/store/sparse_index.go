@@ -122,6 +122,33 @@ func (si *SparseIndex) AddMessage(msg *pb.Message, offset int64, position int64)
 	return si.writeEntry(entry)
 }
 
+// AddMessageByOffset 根据偏移量添加消息到稀疏索引
+func (si *SparseIndex) AddMessageByOffset(offset int64, position int64, timestamp int64) error {
+	si.mu.Lock()
+	defer si.mu.Unlock()
+
+	// 增加消息计数
+	si.messageCount++
+
+	// 检查是否需要创建索引项
+	if !si.config.Enabled || si.messageCount%si.config.IndexInterval != 0 {
+		return nil
+	}
+
+	// 创建新的索引条目
+	entry := SparseIndexEntry{
+		Offset:    offset,
+		Position:  position,
+		Timestamp: timestamp,
+	}
+
+	// 添加到内存中的索引
+	si.entries = append(si.entries, entry)
+
+	// 写入到文件
+	return si.writeEntry(entry)
+}
+
 // writeEntry 将索引条目写入文件
 func (si *SparseIndex) writeEntry(entry SparseIndexEntry) error {
 	// 准备数据

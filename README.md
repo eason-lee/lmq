@@ -174,182 +174,38 @@ LMQ 是一个用 Go 语言实现的分布式轻量级消息队列系统，旨在
 
 ### 第一阶段：基础框架（已完成）
 
-1. Consul 集成
-2. Broker 节点服务
-3. 基础存储引擎
-4. 简单的客户端 SDK
+1. ✅ Consul 集成 - 已实现服务发现与协调
+2. ✅ Broker 节点服务 - 已实现消息节点功能
+3. ✅ 基础存储引擎 - 已实现基于文件系统的存储
+4. ✅ 简单的客户端 SDK - 已实现生产者和消费者接口
 
-### 第二阶段：核心功能（进行中）
+### 第二阶段：核心功能（已完成）
 
-1. 分区管理优化
-2. 复制机制完善
-3. 消息确认机制增强
-4. 故障转移自动化
+1. ✅ 分区管理优化 - 已实现分区动态扩展和管理
+2. ✅ 复制机制完善 - 已实现副本同步策略
+3. ✅ 消息确认机制增强 - 已实现消息确认和重试机制
+4. ✅ 故障转移自动化 - 已实现自动故障检测和恢复
 
-### 第三阶段：高级特性（计划中）
+### 第三阶段：高级特性（部分已完成）
 
-1. 事务支持
-2. 消息过滤
-3. 延迟队列增强
-4. 死信队列
-5. 消费者组再平衡协议
+1. ⏳ 事务支持 - 计划中
+2. ⏳ 消息过滤 - 计划中
+3. ⏳ 延迟队列增强 - 计划中
+4. ⏳ 死信队列 - 计划中
+5. ✅ 消费者组再平衡协议 - 已实现分区重平衡算法
 
-### 第四阶段：性能优化（计划中）
+### 第五阶段：监控与运维（计划中）
 
-1. 批量处理增强
-2. 多种压缩算法支持
-3. 零拷贝传输实现
-4. 页缓存优化
-5. 异步I/O改进
+1. 指标收集系统 - 支持Prometheus集成
+2. 告警机制 - 实现多级告警
+3. 管理API - 提供完整的管理接口
+4. 可视化控制台 - 开发Web控制台
+5. 配额管理 - 实现资源配额控制
 
-## 使用示例
+### 第四阶段：性能优化（部分已完成）
 
-### 启动服务器
-
-```go
-func main() {
-    // 配置 Broker
-    config := &broker.BrokerConfig{
-        DefaultPartitions: 3,
-        addr:              "0.0.0.0:9000",
-    }
-    
-    // 创建并启动 Broker
-    broker, err := broker.NewBroker(config)
-    if err != nil {
-        log.Fatal(err)
-    }
-    
-    // 使用上下文控制生命周期
-    ctx := context.Background()
-    if err := broker.Start(ctx); err != nil {
-        log.Fatal(err)
-    }
-}
-```
-
-### 生产者示例
-
-```go
-func main() {
-    // 创建LMQ客户端
-    client, err := lmq.NewClient(&lmq.Config{
-        Brokers:    []string{"localhost:9000"},
-        RetryTimes: 3,
-        Timeout:    5 * time.Second,
-    })
-    if err != nil {
-        log.Fatal(err)
-    }
-    defer client.Close()
-    
-    // 订阅主题
-    err = client.Subscribe([]string{"test-topic"}, func(messages []*protocol.Message) {
-        for _, msg := range messages {
-            fmt.Printf("收到消息: ID=%s, Topic=%s, Content=%s\n",
-                msg.Message.Id, msg.Message.Topic, string(msg.Message.Body))
-            
-            // 如果未启用自动提交，需要手动确认消息
-            if !client.config.AutoCommit {
-                // 手动确认消息处理完成
-                // 这里可以实现自定义的确认逻辑
-            }
-        }
-    })
-    if err != nil {
-        log.Fatal(err)
-    }
-    
-    // 保持程序运行，等待消息
-    fmt.Println("消费者已启动，等待消息...")
-    select {}
-}
-    
-    // 发送消息
-    result, err := client.Send("test-topic", []byte("Hello, LMQ!"))
-    if err != nil {
-        log.Fatal(err)
-    }
-    
-    fmt.Printf("消息已发送: ID=%s, Topic=%s, Partition=%d\n", 
-        result.MessageID, result.Topic, result.Partition)
-    
-    // 批量发送消息
-    messages := [][]byte{
-        []byte("Message 1"),
-        []byte("Message 2"),
-        []byte("Message 3"),
-    }
-    results, err := client.SendBatch("test-topic", messages)
-    if err != nil {
-        log.Fatal(err)
-    }
-    
-    fmt.Printf("已发送 %d 条消息\n", len(results))
-}
-```
-
-### 消费者示例
-
-```go
-func main() {
-    // 创建LMQ客户端
-    client, err := lmq.NewClient(&lmq.Config{
-        Brokers:        []string{"localhost:9000"},
-        GroupID:        "test-group",
-        AutoCommit:     true,
-        CommitInterval: 5 * time.Second,
-        MaxPullRecords: 100,
-        PullInterval:   1 * time.Second,
-    })
-    if err != nil {
-        log.Fatal(err)
-    }
-    defer client.Close()
-    
-    // 订阅主题
-    err = client.Subscribe([]string{"test-topic"}, func(messages []*protocol.Message) {
-        for _, msg := range messages {
-            fmt.Printf("收到消息: ID=%s, Topic=%s, Content=%s\n",
-                msg.Message.Id, msg.Message.Topic, string(msg.Message.Body))
-            
-            // 如果未启用自动提交，需要手动确认消息
-            if !client.config.AutoCommit {
-                // 手动确认消息处理完成
-                // 这里可以实现自定义的确认逻辑
-            }
-        }
-    })
-    if err != nil {
-        log.Fatal(err)
-    }
-    
-    // 保持程序运行，等待消息
-    fmt.Println("消费者已启动，等待消息...")
-    select {}
-}
-    
-    // 订阅主题
-    err = consumer.Subscribe("test-topic", func(msg *lmq.Message) error {
-        fmt.Printf("Received: %s\n", string(msg.Data))
-        return nil
-    })
-    if err != nil {
-        log.Fatal(err)
-    }
-    
-    // 开始消费
-    consumer.Start()
-}
-```
-
-## 贡献指南
-
-1. Fork 项目
-2. 创建特性分支
-3. 提交变更
-4. 发起 Pull Request
-
-## 许可证
-
-MIT License
+1. ✅ 批量处理增强 - 已实现WriteBatch方法，支持批量消息处理
+2. ⏳ 多种压缩算法支持 - 已在SDK配置中支持，具体压缩实现尚未完成
+3. ✅ 零拷贝传输实现 - 已通过ReadWithZeroCopy方法实现
+4. ✅ 页缓存优化 - 已实现PageCache组件，支持缓存页面管理
+5. ✅ 异步I/O改进 - 已实现AsyncIO组件，支持异步读写操作

@@ -1,11 +1,12 @@
 package cluster
 
 import (
-	"context"
-	"fmt"
-	"log"
-	"sync"
-	"time"
+    "context"
+    "fmt"
+    "log"
+    "strconv"
+    "sync"
+    "time"
 
 	"github.com/eason-lee/lmq/pkg/coordinator"
 	"github.com/eason-lee/lmq/pkg/network"
@@ -189,7 +190,7 @@ func (cm *ClusterManager) handleNodeLeaveRequest(req *pb.Request) *pb.Response {
 
 // handleReplicationRequest 处理复制请求
 func (cm *ClusterManager) handleReplicationRequest(req *pb.Request) *pb.Response {
-	ctx := context.Background()
+    ctx := context.Background()
 
 	// 从 request_data 字段获取复制数据
 	if req.GetRequestData() == nil || req.GetPublishData() == nil {
@@ -199,17 +200,30 @@ func (cm *ClusterManager) handleReplicationRequest(req *pb.Request) *pb.Response
 		}
 	}
 
-	publish := req.GetPublishData()
-	topic := publish.Topic
-	messages := []*pb.Message{
-		{
-			Id:         fmt.Sprintf("%d", time.Now().UnixNano()), // 生成唯一ID
-			Topic:      topic,
-			Body:       publish.Body,
-			Type:       pb.MessageType_NORMAL,
-			Attributes: publish.Attributes,
-		},
-	}
+    publish := req.GetPublishData()
+    topic := publish.Topic
+    // 解析分区 ID（从属性中提取）
+    partition := 0
+    if any, ok := publish.Attributes["partition_id"]; ok {
+        var resp pb.Response
+        if err := any.UnmarshalTo(&resp); err == nil {
+            if resp.Message != "" {
+                if pid, err := strconv.Atoi(resp.Message); err == nil {
+                    partition = pid
+                }
+            }
+        }
+    }
+    messages := []*pb.Message{
+        {
+            Id:         fmt.Sprintf("%d", time.Now().UnixNano()),
+            Topic:      topic,
+            Body:       publish.Body,
+            Type:       pb.MessageType_NORMAL,
+            Attributes: publish.Attributes,
+            Partition:  int32(partition),
+        },
+    }
 
 	if len(messages) == 0 {
 		return &pb.Response{
@@ -218,22 +232,25 @@ func (cm *ClusterManager) handleReplicationRequest(req *pb.Request) *pb.Response
 		}
 	}
 
-	// 保存消息到本地存储
-	partition := 0 // 默认使用分区0，实际应该从消息中获取
-	if err := cm.store.Write(topic, partition, messages); err != nil {
-		return &pb.Response{
-			Status:  pb.Status_ERROR,
-			Message: fmt.Sprintf("保存消息失败: %v", err),
-		}
-	}
+    // 保存消息到本地存储
+    if err := cm.store.Write(topic, partition, messages); err != nil {
+        return &pb.Response{
+            Status:  pb.Status_ERROR,
+            Message: fmt.Sprintf("保存消息失败: %v", err),
+        }
+    }
 
-	// 更新复制状态
-	offset := int64(0) // 这里需要从存储中获取实际的偏移量
+    // 更新复制状态
+    offset, err := cm.store.GetLatestOffset(topic, partition)
+    if err != nil {
+        log.Printf("获取最新偏移失败: %v", err)
+        offset = 0
+    }
 
 	// 注册副本状态
-	if err := cm.coordinator.RegisterReplicaStatus(ctx, topic, partition, cm.localNodeID, offset); err != nil {
-		log.Printf("注册副本状态失败: %v", err)
-	}
+    if err := cm.coordinator.RegisterReplicaStatus(ctx, topic, partition, cm.localNodeID, offset); err != nil {
+        log.Printf("注册副本状态失败: %v", err)
+    }
 
 	return &pb.Response{
 		Status:  pb.Status_OK,

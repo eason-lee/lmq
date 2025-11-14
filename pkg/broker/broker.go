@@ -19,9 +19,10 @@ import (
 	"github.com/eason-lee/lmq/pkg/store"
 	"github.com/eason-lee/lmq/pkg/ut"
 	pb "github.com/eason-lee/lmq/proto"
-	"github.com/google/uuid"
-	"github.com/kevwan/mapreduce/v2"
-	"google.golang.org/protobuf/types/known/timestamppb"
+    "github.com/google/uuid"
+    "github.com/kevwan/mapreduce/v2"
+    "google.golang.org/protobuf/types/known/timestamppb"
+    "google.golang.org/protobuf/types/known/anypb"
 )
 
 // Subscriber 表示一个订阅者
@@ -252,10 +253,10 @@ func (b *Broker) HandlePublish(ctx context.Context, req *pb.PublishRequest) erro
 		Timestamp:  timestamppb.New(time.Now()),
 	}
 
-	partitionID, err := b.SelectPartition(ctx, req.Topic, msg.Id)
-	if err != nil {
-		return fmt.Errorf("选择分区失败: %w", err)
-	}
+    partitionID, err := b.SelectPartition(ctx, req.Topic, msg.Id)
+    if err != nil {
+        return fmt.Errorf("选择分区失败: %w", err)
+    }
 
 	// 获取分区信息
 	partition, err := b.coordinator.GetPartition(ctx, req.Topic, partitionID)
@@ -267,10 +268,11 @@ func (b *Broker) HandlePublish(ctx context.Context, req *pb.PublishRequest) erro
 		return fmt.Errorf("分区 %s-%d 不存在", req.Topic, partitionID)
 	}
 
-	// 写入消息
-	if err := b.store.Write(req.Topic, partitionID, []*pb.Message{msg}); err != nil {
-		return fmt.Errorf("写入消息失败: %w", err)
-	}
+    // 写入消息
+    msg.Partition = int32(partitionID)
+    if err := b.store.Write(req.Topic, partitionID, []*pb.Message{msg}); err != nil {
+        return fmt.Errorf("写入消息失败: %w", err)
+    }
 
 	// 检查当前节点是否是分区的leader
 	isLeader := partition.Leader == b.nodeID
@@ -292,17 +294,17 @@ func (b *Broker) HandlePublish(ctx context.Context, req *pb.PublishRequest) erro
 				}
 
 				// 构建复制请求
-				replicationReq := &pb.Request{
-					Type: "replication",
-					RequestData: &pb.Request_PublishData{
-						PublishData: &pb.PublishRequest{
-							Topic:      req.Topic,
-							Body:       msg.Body,
-							Type:       msg.Type,
-							Attributes: msg.Attributes,
-						},
-					},
-				}
+                replicationReq := &pb.Request{
+                    Type: "replication",
+                    RequestData: &pb.Request_PublishData{
+                        PublishData: &pb.PublishRequest{
+                            Topic:      req.Topic,
+                            Body:       msg.Body,
+                            Type:       msg.Type,
+                            Attributes: addPartitionAttr(msg.Attributes, partitionID),
+                        },
+                    },
+                }
 
 				// 发送复制请求
 				resp, err := client.Send("replication", replicationReq)
@@ -642,4 +644,12 @@ func shouldDeliver(msg *pb.Message) bool {
 
 	deliveryTime := msg.Timestamp.AsTime().Add(time.Duration(pubReq.DelaySeconds) * time.Second)
 	return time.Now().After(deliveryTime)
+}
+func addPartitionAttr(attrs map[string]*anypb.Any, partitionID int) map[string]*anypb.Any {
+    if attrs == nil {
+        attrs = make(map[string]*anypb.Any)
+    }
+    anyVal, _ := anypb.New(&pb.Response{Message: fmt.Sprintf("%d", partitionID)})
+    attrs["partition_id"] = anyVal
+    return attrs
 }

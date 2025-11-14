@@ -86,9 +86,9 @@ func buildAckRequest(groupID string, topic string, messageIDs []string) *pb.Requ
 
 // Send 发送请求并等待响应
 func (c *Client) Send(reqType string, reqMsg interface{}) (*pb.Response, error) {
-	var pbReq *pb.Request
+    var pbReq *pb.Request
 
-	switch reqType {
+    switch reqType {
 	case "publish":
 		msg := reqMsg.(*pb.PublishRequest)
 		pbReq = buildPublishRequest(msg.Topic, msg.Body, msg.Type, msg.Attributes)
@@ -98,12 +98,14 @@ func (c *Client) Send(reqType string, reqMsg interface{}) (*pb.Response, error) 
 	case "pull":
 		msg := reqMsg.(*pb.PullRequest)
 		pbReq = buildPullRequest(msg.GroupId, msg.Topic, msg.MaxMessages)
-	case "ack":
-		msg := reqMsg.(*pb.AckRequest)
-		pbReq = buildAckRequest(msg.GroupId, msg.Topic, msg.MessageIds)
-	default:
-		return nil, fmt.Errorf("未知的请求类型: %s", reqType)
-	}
+    case "ack":
+        msg := reqMsg.(*pb.AckRequest)
+        pbReq = buildAckRequest(msg.GroupId, msg.Topic, msg.MessageIds)
+    case "ping":
+        pbReq = &pb.Request{Type: "ping"}
+    default:
+        return nil, fmt.Errorf("未知的请求类型: %s", reqType)
+    }
 
 	// 序列化请求
 	reqData, err := proto.Marshal(pbReq)

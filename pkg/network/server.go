@@ -122,6 +122,8 @@ func (s *Server) handleRequest(conn net.Conn) {
             } else {
                 err = fmt.Errorf("确认请求数据为空")
             }
+        case "ping":
+            pbResp = &pb.Response{Status: pb.Status_OK, Message: "pong"}
         default:
             // 尝试使用注册的处理器
             s.mu.RLock()

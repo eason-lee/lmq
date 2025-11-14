@@ -26,6 +26,9 @@ import (
     "google.golang.org/protobuf/types/known/timestamppb"
     "google.golang.org/protobuf/types/known/anypb"
     "sync/atomic"
+    
+    "github.com/prometheus/client_golang/prometheus"
+    "github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
 // Subscriber 表示一个订阅者
@@ -57,6 +60,13 @@ type Broker struct {
     ackCount        int64
     subscribeCount  int64
     consumerGroups  map[string][]string
+
+    promPublish    prometheus.Counter
+    promPull       prometheus.Counter
+    promAck        prometheus.Counter
+    promSubscribe  prometheus.Counter
+    promLag        *prometheus.GaugeVec
+    promPartitionOffset *prometheus.GaugeVec
 }
 
 // BrokerConfig 代理配置
@@ -286,6 +296,7 @@ func (b *Broker) HandlePublish(ctx context.Context, req *pb.PublishRequest) erro
         return fmt.Errorf("写入消息失败: %w", err)
     }
     atomic.AddInt64(&b.publishCount, 1)
+    if b.promPublish != nil { b.promPublish.Inc() }
 
 	// 检查当前节点是否是分区的leader
 	isLeader := partition.Leader == b.nodeID
@@ -393,6 +404,7 @@ func (b *Broker) HandleSubscribe(ctx context.Context, req *pb.SubscribeRequest) 
     b.consumerGroups[req.GroupId] = req.Topics
     b.mu.Unlock()
     atomic.AddInt64(&b.subscribeCount, 1)
+    if b.promSubscribe != nil { b.promSubscribe.Inc() }
 
 	return nil
 }
@@ -489,6 +501,10 @@ func (b *Broker) HandlePull(ctx context.Context, req *pb.PullRequest) (*pb.Respo
 		allMessages = append(allMessages, messages...)
 	}
 
+    // 增加拉取计数
+    atomic.AddInt64(&b.pullCount, 1)
+    if b.promPull != nil { b.promPull.Inc() }
+
     // 构造响应
     return &pb.Response{
         Status:  pb.Status_OK,
@@ -499,7 +515,6 @@ func (b *Broker) HandlePull(ctx context.Context, req *pb.PullRequest) (*pb.Respo
             },
         },
     }, nil
-    
 }
 
 // HandleAck 处理确认请求
@@ -535,6 +550,7 @@ func (b *Broker) HandleAck(ctx context.Context, req *pb.AckRequest) error {
         return fmt.Errorf("提交消费位置失败: %w", err)
     }
     atomic.AddInt64(&b.ackCount, 1)
+    if b.promAck != nil { b.promAck.Inc() }
 
 	return nil
 }
@@ -675,8 +691,64 @@ func addPartitionAttr(attrs map[string]*anypb.Any, partitionID int) map[string]*
 }
 
 func (b *Broker) startMetricsServer() {
+    // 注册 Prometheus 指标
+    b.promPublish = prometheus.NewCounter(prometheus.CounterOpts{Name: "lmq_publish_total", Help: "Total published messages"})
+    b.promPull = prometheus.NewCounter(prometheus.CounterOpts{Name: "lmq_pull_total", Help: "Total pull operations"})
+    b.promAck = prometheus.NewCounter(prometheus.CounterOpts{Name: "lmq_ack_total", Help: "Total acknowledgements"})
+    b.promSubscribe = prometheus.NewCounter(prometheus.CounterOpts{Name: "lmq_subscribe_total", Help: "Total subscriptions"})
+    b.promLag = prometheus.NewGaugeVec(prometheus.GaugeOpts{Name: "lmq_consumer_lag", Help: "Consumer lag per group/topic/partition"}, []string{"group","topic","partition"})
+    b.promPartitionOffset = prometheus.NewGaugeVec(prometheus.GaugeOpts{Name: "lmq_partition_log_end_offset", Help: "Partition log end offset (LEO+1)"}, []string{"topic","partition"})
+
+    reg := prometheus.NewRegistry()
+    reg.MustRegister(b.promPublish, b.promPull, b.promAck, b.promSubscribe, b.promLag, b.promPartitionOffset)
+
+    // 后台周期性更新 Gauge 指标
+    go func() {
+        ticker := time.NewTicker(5 * time.Second)
+        defer ticker.Stop()
+        for {
+            select {
+            case <-b.stopCh:
+                return
+            case <-ticker.C:
+                b.mu.RLock()
+                groups := make(map[string][]string)
+                for g, ts := range b.consumerGroups {
+                    dup := make([]string, len(ts))
+                    copy(dup, ts)
+                    groups[g] = dup
+                }
+                b.mu.RUnlock()
+
+                topics := b.store.GetTopics()
+                for _, t := range topics {
+                    ps := b.store.GetPartitions(t)
+                    for _, pid := range ps {
+                        leo, _ := b.store.GetLatestOffset(t, pid)
+                        b.promPartitionOffset.WithLabelValues(t, fmt.Sprintf("%d", pid)).Set(float64(leo+1))
+                    }
+                }
+                for g, ts := range groups {
+                    for _, t := range ts {
+                        ps := b.store.GetPartitions(t)
+                        for _, pid := range ps {
+                            co, _ := b.coordinator.GetConsumerOffset(context.Background(), g, t, pid)
+                            leo, _ := b.store.GetLatestOffset(t, pid)
+                            lag := (leo + 1) - co
+                            if lag < 0 { lag = 0 }
+                            b.promLag.WithLabelValues(g, t, fmt.Sprintf("%d", pid)).Set(float64(lag))
+                        }
+                    }
+                }
+            }
+        }
+    }()
+
     mux := http.NewServeMux()
-    mux.HandleFunc("/metrics", func(w http.ResponseWriter, r *http.Request) {
+    mux.Handle("/metrics", promhttp.HandlerFor(reg, promhttp.HandlerOpts{}))
+    
+    // 保留 JSON 指标在 /metrics.json
+    mux.HandleFunc("/metrics.json", func(w http.ResponseWriter, r *http.Request) {
         b.mu.RLock()
         groups := make(map[string][]string)
         for g, ts := range b.consumerGroups {

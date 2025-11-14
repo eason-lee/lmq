@@ -67,8 +67,8 @@ type Coordinator interface {
 	RegisterConsumer(ctx context.Context, groupID string, topics []string) error
 	UnregisterConsumer(ctx context.Context, groupID string) error
 	GetConsumerGroup(ctx context.Context, groupID string) (*ConsumerGroupInfo, error)
-	CommitOffset(ctx context.Context, groupID string, topic string, offset int64) error
-	GetConsumerOffset(ctx context.Context, groupID string, topic string, partition int) (int64, error)
+    CommitOffset(ctx context.Context, groupID string, topic string, partition int, offset int64) error
+    GetConsumerOffset(ctx context.Context, groupID string, topic string, partition int) (int64, error)
 	GetConsumerPartition(ctx context.Context, groupID string, topic string) (int, error)
 	GetConsumersInGroup(ctx context.Context, groupID string) ([]string, error)
 	GetTopicPartitions(ctx context.Context, topic string) ([]*PartitionInfo, error)

@@ -505,16 +505,16 @@ func (b *Broker) HandleAck(ctx context.Context, req *pb.AckRequest) error {
 		return err
 	}
 
-	// 获取最后一条消息的 offset
-	lastOffset, err := b.store.GetOffset(req.Topic, req.MessageIds[len(req.MessageIds)-1])
-	if err != nil {
-		return fmt.Errorf("获取消息 offset 失败: %w", err)
-	}
+    // 获取最后一条消息的分区与 offset
+    partID, lastOffset, err := b.store.GetMessageLocation(req.Topic, req.MessageIds[len(req.MessageIds)-1])
+    if err != nil {
+        return fmt.Errorf("获取消息 offset 失败: %w", err)
+    }
 
-	// 提交消费位置
-	if err := b.coordinator.CommitOffset(ctx, req.GroupId, req.Topic, lastOffset+1); err != nil {
-		return fmt.Errorf("提交消费位置失败: %w", err)
-	}
+    // 提交消费位置
+    if err := b.coordinator.CommitOffset(ctx, req.GroupId, req.Topic, partID, lastOffset+1); err != nil {
+        return fmt.Errorf("提交消费位置失败: %w", err)
+    }
 
 	return nil
 }

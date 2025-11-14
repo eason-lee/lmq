@@ -157,6 +157,23 @@ func (fs *FileStore) GetOffset(topic string, messageID string) (int64, error) {
 	return 0, fmt.Errorf("消息不存在: %s-%s", topic, messageID)
 }
 
+// GetMessageLocation 获取消息所在的分区及偏移
+func (fs *FileStore) GetMessageLocation(topic string, messageID string) (int, int64, error) {
+    fs.mu.RLock()
+    defer fs.mu.RUnlock()
+
+    if partitions, ok := fs.partitions[topic]; ok {
+        for partID, p := range partitions {
+            offset, err := p.GetOffset(messageID)
+            if err == nil {
+                return partID, offset, nil
+            }
+        }
+    }
+
+    return 0, 0, fmt.Errorf("消息不存在: %s-%s", topic, messageID)
+}
+
 // Close 关闭存储
 func (fs *FileStore) Close() error {
 	fs.mu.Lock()

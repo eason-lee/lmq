@@ -931,30 +931,13 @@ func (c *ConsulCoordinator) GetConsumerGroup(ctx context.Context, groupID string
 }
 
 // CommitOffset 提交消费位置
-func (c *ConsulCoordinator) CommitOffset(ctx context.Context, groupID string, topic string, offset int64) error {
-	group, err := c.GetConsumerGroup(ctx, groupID)
-	if err != nil {
-		return err
-	}
-
-	if group == nil {
-		return fmt.Errorf("消费者组不存在: %s", groupID)
-	}
-
-	group.Offsets[topic] = offset
-
-	data, err := json.Marshal(group)
-	if err != nil {
-		return fmt.Errorf("序列化消费者组信息失败: %w", err)
-	}
-
-	key := fmt.Sprintf("lmq/consumer-groups/%s", groupID)
-	_, err = c.client.KV().Put(&api.KVPair{
-		Key:   key,
-		Value: data,
-	}, nil)
-
-	return err
+func (c *ConsulCoordinator) CommitOffset(ctx context.Context, groupID string, topic string, partition int, offset int64) error {
+    key := fmt.Sprintf("lmq/consumer_groups/%s/offsets/%s/%d", groupID, topic, partition)
+    _, err := c.client.KV().Put(&api.KVPair{
+        Key:   key,
+        Value: []byte(fmt.Sprintf("%d", offset)),
+    }, nil)
+    return err
 }
 
 

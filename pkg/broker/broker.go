@@ -1,28 +1,31 @@
 package broker
 
 import (
-	"context"
-	"crypto/md5"
-	"fmt"
-	"log"
-	"os"
-	"os/signal"
-	"path/filepath"
-	"strings"
-	"sync"
-	"syscall"
-	"time"
+    "context"
+    "crypto/md5"
+    "encoding/json"
+    "fmt"
+    "log"
+    "net/http"
+    "os"
+    "os/signal"
+    "path/filepath"
+    "strings"
+    "sync"
+    "syscall"
+    "time"
 
-	"github.com/eason-lee/lmq/pkg/cluster"
-	"github.com/eason-lee/lmq/pkg/coordinator"
-	"github.com/eason-lee/lmq/pkg/network"
-	"github.com/eason-lee/lmq/pkg/store"
-	"github.com/eason-lee/lmq/pkg/ut"
-	pb "github.com/eason-lee/lmq/proto"
+    "github.com/eason-lee/lmq/pkg/cluster"
+    "github.com/eason-lee/lmq/pkg/coordinator"
+    "github.com/eason-lee/lmq/pkg/network"
+    "github.com/eason-lee/lmq/pkg/store"
+    "github.com/eason-lee/lmq/pkg/ut"
+    pb "github.com/eason-lee/lmq/proto"
     "github.com/google/uuid"
     "github.com/kevwan/mapreduce/v2"
     "google.golang.org/protobuf/types/known/timestamppb"
     "google.golang.org/protobuf/types/known/anypb"
+    "sync/atomic"
 )
 
 // Subscriber 表示一个订阅者
@@ -38,17 +41,22 @@ type Subscriber struct {
 
 // Broker 消息代理，负责消息的路由和分发
 type Broker struct {
-	nodeID          string
-	store           store.Store
-	subscribers     map[string][]*Subscriber // 主题 -> 订阅者列表
-	mu              sync.RWMutex
-	unackedMessages map[string]*pb.Message  // 消息ID -> 消息
-	clusterMgr      *cluster.ClusterManager // 集群管理器
-	coordinator     coordinator.Coordinator // 协调器
-	stopCh          chan struct{}           // 停止信号
-	server          *network.Server         // 网络服务器
-	delayedMsgs     *DelayedMessageQueue    // 延迟消息队列
-	config          *BrokerConfig           // 代理配置
+    nodeID          string
+    store           store.Store
+    subscribers     map[string][]*Subscriber // 主题 -> 订阅者列表
+    mu              sync.RWMutex
+    unackedMessages map[string]*pb.Message  // 消息ID -> 消息
+    clusterMgr      *cluster.ClusterManager // 集群管理器
+    coordinator     coordinator.Coordinator // 协调器
+    stopCh          chan struct{}           // 停止信号
+    server          *network.Server         // 网络服务器
+    delayedMsgs     *DelayedMessageQueue    // 延迟消息队列
+    config          *BrokerConfig           // 代理配置
+    publishCount    int64
+    pullCount       int64
+    ackCount        int64
+    subscribeCount  int64
+    consumerGroups  map[string][]string
 }
 
 // BrokerConfig 代理配置
@@ -56,6 +64,7 @@ type BrokerConfig struct {
     Addr              string
     DefaultPartitions int // 默认分区数量
     ConsulAddr        string // Consul 地址
+    MetricsAddr       string
 }
 
 // DelayedMessageQueue 延迟消息队列
@@ -145,6 +154,7 @@ func NewBroker(config *BrokerConfig) (*Broker, error) {
             DefaultPartitions: 3, // 默认3个分区
             Addr:              "0.0.0.0:9000",
             ConsulAddr:        "127.0.0.1:8500",
+            MetricsAddr:       "0.0.0.0:9100",
         }
     }
 
@@ -161,16 +171,17 @@ func NewBroker(config *BrokerConfig) (*Broker, error) {
         return nil, fmt.Errorf("创建协调器失败: %w", err)
     }
 
-	broker := &Broker{
-		nodeID:          nodeID,
-		store:           fileStore,
-		subscribers:     make(map[string][]*Subscriber),
-		unackedMessages: make(map[string]*pb.Message),
-		coordinator:     consulCoord,
-		stopCh:          make(chan struct{}),
-		delayedMsgs:     NewDelayedMessageQueue(),
-		config:          config,
-	}
+    broker := &Broker{
+        nodeID:          nodeID,
+        store:           fileStore,
+        subscribers:     make(map[string][]*Subscriber),
+        unackedMessages: make(map[string]*pb.Message),
+        coordinator:     consulCoord,
+        stopCh:          make(chan struct{}),
+        delayedMsgs:     NewDelayedMessageQueue(),
+        config:          config,
+        consumerGroups:  make(map[string][]string),
+    }
 
     server, err := network.NewServer(config.Addr, broker)
 	if err != nil {
@@ -222,8 +233,10 @@ func (b *Broker) Start(ctx context.Context) error {
 	// 启动存储同步任务，每5秒同步一次
 	b.StartStorageSyncTask(5 * time.Second)
 
-	// 启动节点同步任务
-	go b.startNodeSyncTask(ctx, 10*time.Second)
+    // 启动节点同步任务
+    go b.startNodeSyncTask(ctx, 10*time.Second)
+
+    go b.startMetricsServer()
 
     log.Printf("LMQ broker已启动，节点ID: %s, 监听地址: %s", b.nodeID, b.config.Addr)
 
@@ -268,11 +281,11 @@ func (b *Broker) HandlePublish(ctx context.Context, req *pb.PublishRequest) erro
 		return fmt.Errorf("分区 %s-%d 不存在", req.Topic, partitionID)
 	}
 
-    // 写入消息
     msg.Partition = int32(partitionID)
     if err := b.store.Write(req.Topic, partitionID, []*pb.Message{msg}); err != nil {
         return fmt.Errorf("写入消息失败: %w", err)
     }
+    atomic.AddInt64(&b.publishCount, 1)
 
 	// 检查当前节点是否是分区的leader
 	isLeader := partition.Leader == b.nodeID
@@ -371,10 +384,15 @@ func (b *Broker) HandleSubscribe(ctx context.Context, req *pb.SubscribeRequest) 
 		return fmt.Errorf("注册消费者组失败: %w", err)
 	}
 
-	// 为消费者组分配分区
-	if err := b.assignPartitionsToConsumerGroup(ctx, req.GroupId, req.Topics); err != nil {
-		return fmt.Errorf("分配分区失败: %w", err)
-	}
+    // 为消费者组分配分区
+    if err := b.assignPartitionsToConsumerGroup(ctx, req.GroupId, req.Topics); err != nil {
+        return fmt.Errorf("分配分区失败: %w", err)
+    }
+
+    b.mu.Lock()
+    b.consumerGroups[req.GroupId] = req.Topics
+    b.mu.Unlock()
+    atomic.AddInt64(&b.subscribeCount, 1)
 
 	return nil
 }
@@ -471,16 +489,17 @@ func (b *Broker) HandlePull(ctx context.Context, req *pb.PullRequest) (*pb.Respo
 		allMessages = append(allMessages, messages...)
 	}
 
-	// 构造响应
-	return &pb.Response{
-		Status:  pb.Status_OK,
-		Message: "拉取消息成功",
-		ResponseData: &pb.Response_BatchMessagesData{
-			BatchMessagesData: &pb.BatchMessagesResponse{
-				Messages: allMessages,
-			},
-		},
-	}, nil
+    // 构造响应
+    return &pb.Response{
+        Status:  pb.Status_OK,
+        Message: "拉取消息成功",
+        ResponseData: &pb.Response_BatchMessagesData{
+            BatchMessagesData: &pb.BatchMessagesResponse{
+                Messages: allMessages,
+            },
+        },
+    }, nil
+    
 }
 
 // HandleAck 处理确认请求
@@ -515,6 +534,7 @@ func (b *Broker) HandleAck(ctx context.Context, req *pb.AckRequest) error {
     if err := b.coordinator.CommitOffset(ctx, req.GroupId, req.Topic, partID, lastOffset+1); err != nil {
         return fmt.Errorf("提交消费位置失败: %w", err)
     }
+    atomic.AddInt64(&b.ackCount, 1)
 
 	return nil
 }
@@ -652,4 +672,73 @@ func addPartitionAttr(attrs map[string]*anypb.Any, partitionID int) map[string]*
     anyVal, _ := anypb.New(&pb.Response{Message: fmt.Sprintf("%d", partitionID)})
     attrs["partition_id"] = anyVal
     return attrs
+}
+
+func (b *Broker) startMetricsServer() {
+    mux := http.NewServeMux()
+    mux.HandleFunc("/metrics", func(w http.ResponseWriter, r *http.Request) {
+        b.mu.RLock()
+        groups := make(map[string][]string)
+        for g, ts := range b.consumerGroups {
+            dup := make([]string, len(ts))
+            copy(dup, ts)
+            groups[g] = dup
+        }
+        b.mu.RUnlock()
+
+        topics := b.store.GetTopics()
+        type partStat struct{ ID int; LatestOffset int64; Leader string; ISRSize int }
+        type topicStat struct{ Topic string; Partitions []partStat }
+        var topicStats []topicStat
+        for _, t := range topics {
+            ps := b.store.GetPartitions(t)
+            var parts []partStat
+            for _, pid := range ps {
+                lo, _ := b.store.GetLatestOffset(t, pid)
+                pinfo, _ := b.coordinator.GetPartition(context.Background(), t, pid)
+                leader := ""
+                isrLen := 0
+                if pinfo != nil {
+                    leader = pinfo.Leader
+                    isrLen = len(pinfo.ISR)
+                }
+                parts = append(parts, partStat{ID: pid, LatestOffset: lo, Leader: leader, ISRSize: isrLen})
+            }
+            topicStats = append(topicStats, topicStat{Topic: t, Partitions: parts})
+        }
+
+        type lagStat struct{ Group string; Topic string; Partition int; ConsumerOffset int64; LogEndOffset int64; Lag int64 }
+        var lags []lagStat
+        for g, ts := range groups {
+            for _, t := range ts {
+                ps := b.store.GetPartitions(t)
+                for _, pid := range ps {
+                    co, _ := b.coordinator.GetConsumerOffset(context.Background(), g, t, pid)
+                    leo, _ := b.store.GetLatestOffset(t, pid)
+                    leop1 := leo + 1
+                    lag := leop1 - co
+                    if lag < 0 {
+                        lag = 0
+                    }
+                    lags = append(lags, lagStat{Group: g, Topic: t, Partition: pid, ConsumerOffset: co, LogEndOffset: leop1, Lag: lag})
+                }
+            }
+        }
+
+        resp := map[string]interface{}{
+            "node_id": b.nodeID,
+            "addr": b.config.Addr,
+            "counters": map[string]int64{
+                "publish_total": atomic.LoadInt64(&b.publishCount),
+                "pull_total": atomic.LoadInt64(&b.pullCount),
+                "ack_total": atomic.LoadInt64(&b.ackCount),
+                "subscribe_total": atomic.LoadInt64(&b.subscribeCount),
+            },
+            "topics": topicStats,
+            "consumer_lag": lags,
+        }
+        w.Header().Set("Content-Type", "application/json")
+        _ = json.NewEncoder(w).Encode(resp)
+    })
+    _ = http.ListenAndServe(b.config.MetricsAddr, mux)
 }

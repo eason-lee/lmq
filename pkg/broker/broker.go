@@ -52,8 +52,9 @@ type Broker struct {
 
 // BrokerConfig 代理配置
 type BrokerConfig struct {
-	addr              string
-	DefaultPartitions int // 默认分区数量
+    Addr              string
+    DefaultPartitions int // 默认分区数量
+    ConsulAddr        string // Consul 地址
 }
 
 // DelayedMessageQueue 延迟消息队列
@@ -137,26 +138,27 @@ func generateStoreDir(nodeID string) string {
 
 // NewBroker 创建新的broker实例
 func NewBroker(config *BrokerConfig) (*Broker, error) {
-	// 使用默认配置
-	if config == nil {
-		config = &BrokerConfig{
-			DefaultPartitions: 3, // 默认3个分区
-			addr:              "0.0.0.0:9000",
-		}
-	}
+    // 使用默认配置
+    if config == nil {
+        config = &BrokerConfig{
+            DefaultPartitions: 3, // 默认3个分区
+            Addr:              "0.0.0.0:9000",
+            ConsulAddr:        "127.0.0.1:8500",
+        }
+    }
 
-	nodeID := generateNodeID(config.addr)
-	storeDir := generateStoreDir(nodeID)
+    nodeID := generateNodeID(config.Addr)
+    storeDir := generateStoreDir(nodeID)
 
 	fileStore, err := store.NewFileStore(storeDir)
 	if err != nil {
 		return nil, err
 	}
 
-	consulCoord, err := coordinator.NewConsulCoordinator("localhost:8500")
-	if err != nil {
-		return nil, fmt.Errorf("创建协调器失败: %w", err)
-	}
+    consulCoord, err := coordinator.NewConsulCoordinator(config.ConsulAddr)
+    if err != nil {
+        return nil, fmt.Errorf("创建协调器失败: %w", err)
+    }
 
 	broker := &Broker{
 		nodeID:          nodeID,
@@ -169,13 +171,13 @@ func NewBroker(config *BrokerConfig) (*Broker, error) {
 		config:          config,
 	}
 
-	server, err := network.NewServer(config.addr, broker)
+    server, err := network.NewServer(config.Addr, broker)
 	if err != nil {
 		return nil, fmt.Errorf("创建网络服务器失败: %w", err)
 	}
 	broker.server = server
 
-	broker.clusterMgr = cluster.NewClusterManager(nodeID, config.addr, fileStore, consulCoord)
+    broker.clusterMgr = cluster.NewClusterManager(nodeID, config.Addr, fileStore, consulCoord)
 	broker.clusterMgr.RegisterHandlers(server)
 
 	return broker, nil
@@ -222,7 +224,7 @@ func (b *Broker) Start(ctx context.Context) error {
 	// 启动节点同步任务
 	go b.startNodeSyncTask(ctx, 10*time.Second)
 
-	log.Printf("LMQ broker已启动，节点ID: %s, 监听地址: %s", b.nodeID, b.config.addr)
+    log.Printf("LMQ broker已启动，节点ID: %s, 监听地址: %s", b.nodeID, b.config.Addr)
 
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)

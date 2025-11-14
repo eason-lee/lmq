@@ -2,6 +2,7 @@ package main
 
 import (
     "context"
+    "flag"
     "log"
     "os"
     "strconv"
@@ -13,15 +14,22 @@ import (
 func main() {
     ctx := context.Background()
 
-    addr := getenv("LMQ_ADDR", "0.0.0.0:9000")
-    consul := getenv("LMQ_CONSUL_ADDR", "127.0.0.1:8500")
-    parts := getenvInt("LMQ_DEFAULT_PARTITIONS", 3)
+    envAddr := getenv("LMQ_ADDR", "0.0.0.0:9000")
+    envConsul := getenv("LMQ_CONSUL_ADDR", "127.0.0.1:8500")
+    envParts := getenvInt("LMQ_DEFAULT_PARTITIONS", 3)
+
+    flagAddr := flag.String("addr", envAddr, "broker listen address")
+    flagConsul := flag.String("consul", envConsul, "consul address")
+    flagParts := flag.Int("partitions", envParts, "default partitions")
+    flag.Parse()
 
     cfg := &broker.BrokerConfig{
-        DefaultPartitions: parts,
-        ConsulAddr:        consul,
-        Addr:              addr,
+        DefaultPartitions: *flagParts,
+        ConsulAddr:        *flagConsul,
+        Addr:              *flagAddr,
     }
+
+    log.Printf("Starting LMQ: addr=%s consul=%s default_partitions=%d", cfg.Addr, cfg.ConsulAddr, cfg.DefaultPartitions)
 
     b, err := broker.NewBroker(cfg)
     if err != nil {

@@ -11,8 +11,8 @@ import (
 
 // SparseIndexConfig 稀疏索引配置
 type SparseIndexConfig struct {
-	IndexInterval int  // 每隔多少条消息创建一个索引项
-	Enabled       bool // 是否启用稀疏索引
+    IndexInterval int  // 每隔多少条消息创建一个索引项
+    Enabled       bool // 是否启用稀疏索引
 }
 
 // DefaultSparseIndexConfig 默认稀疏索引配置
@@ -96,57 +96,51 @@ func loadSparseIndexEntries(file *os.File) ([]SparseIndexEntry, error) {
 
 // AddMessage 添加消息到稀疏索引
 func (si *SparseIndex) AddMessage(msg *pb.Message, offset int64, position int64) error {
-	si.mu.Lock()
-	defer si.mu.Unlock()
+    si.mu.Lock()
+    defer si.mu.Unlock()
 
-	// 增加消息计数
-	si.messageCount++
+    if !si.config.Enabled {
+        return nil
+    }
 
-	// 检查是否需要创建索引项
-	if !si.config.Enabled || si.messageCount%si.config.IndexInterval != 0 {
-		return nil
-	}
+    // 按偏移量间隔采样：仅当 offset 可整除 IndexInterval 时建索引
+    if si.config.IndexInterval <= 0 || offset%int64(si.config.IndexInterval) != 0 {
+        return nil
+    }
 
-	// 创建新的索引条目
-	timestamp := msg.Timestamp.Seconds
-	entry := SparseIndexEntry{
-		Offset:    offset,
-		Position:  position,
-		Timestamp: timestamp,
-	}
+    timestamp := msg.Timestamp.Seconds
+    entry := SparseIndexEntry{
+        Offset:    offset,
+        Position:  position,
+        Timestamp: timestamp,
+    }
 
-	// 添加到内存中的索引
-	si.entries = append(si.entries, entry)
-
-	// 写入到文件
-	return si.writeEntry(entry)
+    si.entries = append(si.entries, entry)
+    return si.writeEntry(entry)
 }
 
 // AddMessageByOffset 根据偏移量添加消息到稀疏索引
 func (si *SparseIndex) AddMessageByOffset(offset int64, position int64, timestamp int64) error {
-	si.mu.Lock()
-	defer si.mu.Unlock()
+    si.mu.Lock()
+    defer si.mu.Unlock()
 
-	// 增加消息计数
-	si.messageCount++
+    if !si.config.Enabled {
+        return nil
+    }
 
-	// 检查是否需要创建索引项
-	if !si.config.Enabled || si.messageCount%si.config.IndexInterval != 0 {
-		return nil
-	}
+    // 按偏移量间隔采样：仅当 offset 可整除 IndexInterval 时建索引
+    if si.config.IndexInterval <= 0 || offset%int64(si.config.IndexInterval) != 0 {
+        return nil
+    }
 
-	// 创建新的索引条目
-	entry := SparseIndexEntry{
-		Offset:    offset,
-		Position:  position,
-		Timestamp: timestamp,
-	}
+    entry := SparseIndexEntry{
+        Offset:    offset,
+        Position:  position,
+        Timestamp: timestamp,
+    }
 
-	// 添加到内存中的索引
-	si.entries = append(si.entries, entry)
-
-	// 写入到文件
-	return si.writeEntry(entry)
+    si.entries = append(si.entries, entry)
+    return si.writeEntry(entry)
 }
 
 // writeEntry 将索引条目写入文件
@@ -168,22 +162,20 @@ func (si *SparseIndex) writeEntry(entry SparseIndexEntry) error {
 
 // FindPosition 查找指定偏移量对应的位置
 func (si *SparseIndex) FindPosition(offset int64) (int64, error) {
-	si.mu.RLock()
-	defer si.mu.RUnlock()
+    si.mu.RLock()
+    defer si.mu.RUnlock()
 
-	if len(si.entries) == 0 {
-		return 0, fmt.Errorf("索引为空")
-	}
+    if len(si.entries) == 0 {
+        return 0, fmt.Errorf("索引为空")
+    }
 
-	// 如果偏移量小于第一个索引条目，返回第一个条目的位置
-	if offset <= si.entries[0].Offset {
-		return si.entries[0].Position, nil
-	}
-
-	// 如果偏移量大于最后一个索引条目，返回最后一个条目的位置
-	if offset >= si.entries[len(si.entries)-1].Offset {
-		return si.entries[len(si.entries)-1].Position, nil
-	}
+    // 范围检查：小于最小或大于最大偏移量视为错误
+    if offset < si.entries[0].Offset {
+        return 0, fmt.Errorf("偏移量小于最小索引条目")
+    }
+    if offset > si.entries[len(si.entries)-1].Offset {
+        return 0, fmt.Errorf("偏移量大于最大索引条目")
+    }
 
 	// 二分查找最接近但不大于目标偏移量的索引条目
 	return si.binarySearch(offset)

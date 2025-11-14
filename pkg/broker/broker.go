@@ -308,10 +308,10 @@ func (b *Broker) HandlePublish(ctx context.Context, req *pb.PublishRequest) erro
 					return err
 				}
 
-				if resp.Status != pb.Status_OK {
-					return err
-				}
-				return nil
+                if resp.Status != pb.Status_OK {
+                    return fmt.Errorf("复制失败: status=%v, message=%s", resp.Status, resp.Message)
+                }
+                return nil
 			}
 		}
 

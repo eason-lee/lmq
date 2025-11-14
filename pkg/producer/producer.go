@@ -56,7 +56,7 @@ func NewProducer(config *ProducerConfig) (*Producer, error) {
 	}, nil
 }
 
-func (p *Producer)newMessage(topic string, body []byte) *pb.Message {
+func (p *Producer) newMessage(topic string, body []byte) *pb.Message {
 	now := timestamppb.Now()
 	return &pb.Message{
 		Id:         uuid.New().String(),
@@ -166,33 +166,18 @@ func (p *Producer) selectBroker(topic string) string {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
-	// 获取可用的 broker 列表
 	brokers := p.config.Brokers
 	if len(brokers) == 0 {
-		return "" // 没有可用的 broker
+		return ""
 	}
 
-	// 检查现有连接的状态
-	var availableBrokers []string
-	for _, broker := range brokers {
-		if client, ok := p.clients[broker]; ok {
-			// 发送心跳检查连接状态
-			if _, err := client.Send("heartbeat", nil); err == nil {
-				availableBrokers = append(availableBrokers, broker)
-			}
-		} else {
-			// 没有连接的 broker 也加入可用列表，后续会尝试连接
-			availableBrokers = append(availableBrokers, broker)
+	// 简单策略：优先使用已建立连接的 broker，否则返回列表第一个
+	for _, addr := range brokers {
+		if _, ok := p.clients[addr]; ok {
+			return addr
 		}
 	}
-
-	if len(availableBrokers) == 0 {
-		return brokers[0] // 如果没有可用的，返回第一个
-	}
-
-	// 使用简单的轮询策略
-	// 可以基于连接数、负载等实现更复杂的策略
-	return availableBrokers[0]
+	return brokers[0]
 }
 
 // getClient 获取或创建到指定 broker 的连接

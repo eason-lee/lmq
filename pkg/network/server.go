@@ -93,38 +93,46 @@ func (s *Server) handleRequest(conn net.Conn) {
 			return
 		}
 
-		// 处理请求
-		var pbResp *pb.Response
-		var err error
+        // 处理请求
+        var pbResp *pb.Response
+        var err error
 
-		switch pbReq.Type {
-		case "publish":
-			if pubData := pbReq.GetPublishData(); pubData != nil {
-				pbResp, err = s.handlePublish(pubData)
-			} else {
-				err = fmt.Errorf("发布请求数据为空")
-			}
-		case "subscribe":
-			if subData := pbReq.GetSubscribeData(); subData != nil {
-				pbResp, err = s.handleSubscribe(subData)
-			} else {
-				err = fmt.Errorf("订阅请求数据为空")
-			}
-		case "pull":
-			if pullData := pbReq.GetPullData(); pullData != nil {
-				pbResp, err = s.handlePull(pullData)
-			} else {
-				err = fmt.Errorf("拉取请求数据为空")
-			}
-		case "ack":
-			if ackData := pbReq.GetAckData(); ackData != nil {
-				pbResp, err = s.handleAck(ackData)
-			} else {
-				err = fmt.Errorf("确认请求数据为空")
-			}
-		default:
-			err = fmt.Errorf("未知的请求类型: %s", pbReq.Type)
-		}
+        switch pbReq.Type {
+        case "publish":
+            if pubData := pbReq.GetPublishData(); pubData != nil {
+                pbResp, err = s.handlePublish(pubData)
+            } else {
+                err = fmt.Errorf("发布请求数据为空")
+            }
+        case "subscribe":
+            if subData := pbReq.GetSubscribeData(); subData != nil {
+                pbResp, err = s.handleSubscribe(subData)
+            } else {
+                err = fmt.Errorf("订阅请求数据为空")
+            }
+        case "pull":
+            if pullData := pbReq.GetPullData(); pullData != nil {
+                pbResp, err = s.handlePull(pullData)
+            } else {
+                err = fmt.Errorf("拉取请求数据为空")
+            }
+        case "ack":
+            if ackData := pbReq.GetAckData(); ackData != nil {
+                pbResp, err = s.handleAck(ackData)
+            } else {
+                err = fmt.Errorf("确认请求数据为空")
+            }
+        default:
+            // 尝试使用注册的处理器
+            s.mu.RLock()
+            handler := s.handlers[pbReq.Type]
+            s.mu.RUnlock()
+            if handler != nil {
+                pbResp = handler(&pbReq)
+            } else {
+                err = fmt.Errorf("未知的请求类型: %s", pbReq.Type)
+            }
+        }
 
 		// 如果处理出错，构造错误响应
 		if err != nil {

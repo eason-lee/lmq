@@ -11,51 +11,47 @@ import (
 )
 
 func TestSegmentWriteBatch(t *testing.T) {
-	// 创建临时目录
-	tempDir, err := os.MkdirTemp("", "segment-test")
-	if err != nil {
-		t.Fatalf("创建临时目录失败: %v", err)
-	}
-	defer os.RemoveAll(tempDir)
+    // 创建临时根目录
+    tempDir, err := os.MkdirTemp("", "segment-test")
+    if err != nil {
+        t.Fatalf("创建临时目录失败: %v", err)
+    }
+    defer os.RemoveAll(tempDir)
 
-	// 创建段
-	segment, err := NewSegment(tempDir, 0, 1024*1024*10) // 10MB
-	if err != nil {
-		t.Fatalf("创建段失败: %v", err)
-	}
-	defer segment.Close()
+    // 测试批量写入（每个子测试使用独立段，避免相互影响）
+    batchSizes := []int{1, 10, 100, 1000}
+    for _, batchSize := range batchSizes {
+        t.Run(fmt.Sprintf("BatchSize_%d", batchSize), func(t *testing.T) {
+            // 为子测试创建独立目录与段
+            subDir := filepath.Join(tempDir, fmt.Sprintf("batch_%d", batchSize))
+            if err := os.MkdirAll(subDir, 0755); err != nil {
+                t.Fatalf("创建子目录失败: %v", err)
+            }
+            segment, err := NewSegment(subDir, 0, 1024*1024*10) // 10MB
+            if err != nil {
+                t.Fatalf("创建段失败: %v", err)
+            }
+            defer segment.Close()
 
-	// 测试批量写入
-	batchSizes := []int{1, 10, 100, 1000}
-	for _, batchSize := range batchSizes {
-		t.Run(fmt.Sprintf("BatchSize_%d", batchSize), func(t *testing.T) {
-			// 准备测试数据
-			messages := generateTestMessages(batchSize)
+            // 准备测试数据
+            messages := generateTestMessages(batchSize)
 
-			// 测试批量写入性能
-			err := segment.WriteBatch(messages)
-			if err != nil {
-				t.Fatalf("批量写入失败: %v", err)
-			}
+            // 批量写入
+            if err := segment.WriteBatch(messages); err != nil {
+                t.Fatalf("批量写入失败: %v", err)
+            }
 
-			// 创建新段用于单条写入测试
-			singleSegment, err := NewSegment(tempDir, int64(batchSize), 1024*1024*10)
-			if err != nil {
-				t.Fatalf("创建段失败: %v", err)
-			}
-			defer singleSegment.Close()
-
-			// 验证写入的消息数量
-			latestOffset, err := segment.GetLatestOffset()
-			if err != nil {
-				t.Fatalf("获取最新偏移量失败: %v", err)
-			}
-			expectedOffset := int64(batchSize - 1)
-			if latestOffset != expectedOffset {
-				t.Errorf("最新偏移量不匹配，期望: %d, 实际: %d", expectedOffset, latestOffset)
-			}
-		})
-	}
+            // 验证写入的消息数量：最新偏移量应为 batchSize-1
+            latestOffset, err := segment.GetLatestOffset()
+            if err != nil {
+                t.Fatalf("获取最新偏移量失败: %v", err)
+            }
+            expectedOffset := int64(batchSize - 1)
+            if latestOffset != expectedOffset {
+                t.Errorf("最新偏移量不匹配，期望: %d, 实际: %d", expectedOffset, latestOffset)
+            }
+        })
+    }
 }
 
 // 生成测试消息

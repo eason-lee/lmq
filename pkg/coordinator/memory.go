@@ -337,6 +337,12 @@ func (m *MemoryCoordinator) GetConsumerAssignedPartitions(ctx context.Context, g
         if ct, ok := grp[consumerID]; ok {
             return append([]int(nil), ct[topic]...), nil
         }
+        // 如果指定消费者没有分配，返回该组在该主题下的所有分区分配的并集
+        var parts []int
+        for _, ct := range grp {
+            parts = append(parts, ct[topic]...)
+        }
+        return parts, nil
     }
     return []int{}, nil
 }
@@ -401,4 +407,3 @@ func splitHostPort(addr string) (string, int) {
     }
     return addr, 0
 }
-

@@ -90,15 +90,14 @@ func (p *Producer) Send(topic string, data []byte, partitionKey string) (*SendRe
 
 	// 发送消息
 	var lastErr error
+	pub := &pb.PublishRequest{Topic: topic, Body: data, Type: msg.Type, Attributes: msg.Attributes}
 	for i := 0; i < p.config.RetryTimes; i++ {
-		resp, err := client.Send("publish", msg)
+		resp, err := client.Send("publish", pub)
 		if err == nil && resp.Status == pb.Status_OK {
-			// 解析响应中的分区信息
 			partition := 0
 			if resp.Message != "" {
-				partition, err = strconv.Atoi(resp.Message)
-				if err != nil {
-					return nil, fmt.Errorf("解析分区信息失败: %w", err)
+				if p, perr := strconv.Atoi(resp.Message); perr == nil {
+					partition = p
 				}
 			}
 

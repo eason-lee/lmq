@@ -413,7 +413,7 @@ func (b *Broker) HandleSubscribe(ctx context.Context, req *pb.SubscribeRequest) 
 			return fmt.Errorf("检查主题是否存在失败: %w", err)
 		}
 
-		if !exists {
+        if !exists {
 			// 主题不存在，自动创建
 			log.Printf("主题 %s 不存在，自动创建", topic)
 
@@ -427,9 +427,14 @@ func (b *Broker) HandleSubscribe(ctx context.Context, req *pb.SubscribeRequest) 
 			if err := partitionManager.CreateTopicPartitions(ctx, topic, b.config.DefaultPartitions, 1); err != nil { // 默认复制因子为1
 				return fmt.Errorf("创建主题分区失败: %w", err)
 			}
-			log.Printf("已为主题 %s 创建 %d 个分区，使用 %s 重平衡策略", topic, b.config.DefaultPartitions, store.DefaultRebalancer.Name())
-		}
-	}
+            log.Printf("已为主题 %s 创建 %d 个分区，使用 %s 重平衡策略", topic, b.config.DefaultPartitions, store.DefaultRebalancer.Name())
+            // 确保持久化存储中也创建对应分区，避免读取时分区不存在
+            parts, _ := b.coordinator.GetTopicPartitions(ctx, topic)
+            for _, p := range parts {
+                _ = b.store.CreatePartition(topic, p.ID)
+            }
+        }
+    }
 
 	// 注册消费者组
 	if err := b.coordinator.RegisterConsumer(ctx, req.GroupId, req.Topics); err != nil {

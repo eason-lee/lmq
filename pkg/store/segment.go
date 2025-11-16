@@ -104,10 +104,13 @@ func (s *Segment) Read(offset int64, count int) ([]*pb.Message, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	// 检查偏移量是否在段范围内
-	if offset < s.baseOffset || offset >= s.nextOffset {
-		return nil, fmt.Errorf("偏移量 %d 不在段范围内 [%d, %d)", offset, s.baseOffset, s.nextOffset)
-	}
+    // 检查偏移量是否在段范围内
+    if offset < s.baseOffset {
+        return nil, fmt.Errorf("偏移量 %d 不在段范围内 [%d, %d)", offset, s.baseOffset, s.nextOffset)
+    }
+    if offset >= s.nextOffset {
+        return []*pb.Message{}, nil
+    }
 
 	// 使用稀疏索引找到最近的位置
 	position, err := s.sparseIndex.FindPosition(offset)

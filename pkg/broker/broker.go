@@ -205,6 +205,47 @@ func NewBroker(config *BrokerConfig) (*Broker, error) {
 	return broker, nil
 }
 
+// NewBrokerWithCoordinator 允许注入自定义协调器（用于测试）
+func NewBrokerWithCoordinator(config *BrokerConfig, coord coordinator.Coordinator) (*Broker, error) {
+    if config == nil {
+        config = &BrokerConfig{DefaultPartitions: 3, Addr: "0.0.0.0:9000", ConsulAddr: "127.0.0.1:8500", MetricsAddr: "0.0.0.0:9100"}
+    }
+    nodeID := generateNodeID(config.Addr)
+    storeDir := generateStoreDir(nodeID)
+    fileStore, err := store.NewFileStore(storeDir)
+    if err != nil { return nil, err }
+    broker := &Broker{
+        nodeID:          nodeID,
+        store:           fileStore,
+        subscribers:     make(map[string][]*Subscriber),
+        unackedMessages: make(map[string]*pb.Message),
+        coordinator:     coord,
+        stopCh:          make(chan struct{}),
+        delayedMsgs:     NewDelayedMessageQueue(),
+        config:          config,
+        consumerGroups:  make(map[string][]string),
+    }
+    server, err := network.NewServer(config.Addr, broker)
+    if err != nil { return nil, fmt.Errorf("创建网络服务器失败: %w", err) }
+    broker.server = server
+    broker.clusterMgr = cluster.NewClusterManager(nodeID, config.Addr, fileStore, coord)
+    broker.clusterMgr.RegisterHandlers(server)
+    return broker, nil
+}
+
+// StartNoBlock 启动但不阻塞等待信号（用于测试）
+func (b *Broker) StartNoBlock(ctx context.Context) error {
+    if err := b.server.Start(); err != nil { return fmt.Errorf("启动网络服务器失败: %w", err) }
+    if err := b.clusterMgr.Start(ctx); err != nil { return err }
+    b.StartDelayedMessageProcessor(1 * time.Second)
+    b.StartCleanupTask(1*time.Hour, store.DefaultCleanupPolicy)
+    b.StartStorageSyncTask(5 * time.Second)
+    go b.startNodeSyncTask(ctx, 10*time.Second)
+    go b.startMetricsServer()
+    log.Printf("LMQ broker(测试)已启动，节点ID: %s, 监听地址: %s", b.nodeID, b.config.Addr)
+    return nil
+}
+
 // StartStorageSyncTask 启动存储同步任务
 func (b *Broker) StartStorageSyncTask(interval time.Duration) {
 	go func() {
